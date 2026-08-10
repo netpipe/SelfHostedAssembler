@@ -1,0 +1,30 @@
+--- a/selfHosted.asm
++++ b/selfHosted.asm
+@@ -128,8 +128,13 @@
+     cmp al, 'm'
+     je parse_mov
+     cmp al, 'a'
+     je parse_add
+-    cmp al, 's'
+-    je parse_sub
++    cmp al, 's'
++    jne .not_s
++    mov al, byte [r13 + 1]    ; Check 2nd letter: 'h' (shift) vs 'u' (sub)
++    cmp al, 'h'
++    je parse_shift
++    jmp parse_sub
++.not_s:
+     cmp al, 'c'
+     je parse_cmp
+     cmp al, 'x'
+@@ -172,6 +177,10 @@
+ parse_sub:
+     call emit_alu_op
+     jmp end_instr
++
++parse_shift:
++    add qword [pc_vaddr], 4   ; Assume 4 bytes for shl/shr r64, imm8
++    jmp end_instr
+ 
+ ; ==============================================================================
+ ; HELPER FUNCTIONS

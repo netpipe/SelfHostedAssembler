@@ -1,0 +1,60 @@
+--- a/selfContained.asm
++++ b/selfContained.asm
+@@ -175,6 +175,8 @@
+         je parse_sys
+         cmp r15, 7
+         je parse_db
++        cmp r15, 8
++        je parse_shift
+         ret
+ .not_found:
+     ret
+@@ -293,6 +295,33 @@
+     jmp .db_loop
+ .db_done:
+     ret
+ 
++parse_shift:
++    movzx r14, byte [rsi + 5] ; Opcode (0xC1)
++    movzx r15, byte [rsi + 6] ; ModRM base (0xE0 for shl, 0xE8 for shr)
++    call get_token
++    call is_register
++    cmp rax, -1
++    je error_exit
++    mov r12, rax              ; r12 = destination register index (0-7)
++    
++    call get_token
++    call is_number
++    cmp rdx, 1
++    je .got_imm
++    jmp error_exit            ; Must be an immediate number
++.got_imm:
++    mov r13, rax              ; r13 = imm8 shift amount
++    
++    test r11, r11             ; r11 is the pass mode (0 or 1)
++    jz .skip_emit
++    
++    call emit_byte
++    db 0x48                   ; REX.W prefix (64-bit operand size)
++    mov rdi, r14              ; Opcode 0xC1
++    call emit_byte
++    mov rdi, r15              ; ModRM base (0xE0 or 0xE8)
++    add rdi, r12              ; Add dest register index to ModRM byte
++    call emit_byte
++    mov rdi, r13              ; imm8 shift amount
++    call emit_byte
++.skip_emit:
++    add qword [pc_vaddr], 4   ; 4 bytes total size: REX + Opcode + ModRM + imm8
++    ret
++
+ ; ==============================================================================
+ ; OPCODE TABLE
+@@ -304,6 +333,8 @@
+     db "cmp ", 0, 0x39, 0, 0
+     db "xor ", 0, 0x31, 0, 0
+     db "and ", 0, 0x21, 0, 0
++    db "shl ", 8, 0xC1, 0xE0, 0  ; Type 8, Opcode 0xC1, ModRM base 0xE0
++    db "shr ", 8, 0xC1, 0xE8, 0  ; Type 8, Opcode 0xC1, ModRM base 0xE8
+     db "jmp ", 2, 0xE9, 0, 0
+     db "je  ", 3, 0x84, 0, 0
+     db "jne ", 3, 0x85, 0, 0

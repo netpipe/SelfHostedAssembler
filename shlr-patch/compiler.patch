@@ -1,0 +1,78 @@
+--- a/c-compiler/compiler.c
++++ b/c-compiler/compiler.c
+@@ -12,6 +12,8 @@
+ int var_start[256];
+ int var_len[256];
+ 
++int last_was_const;
++int last_const_val;
++
+ int asm_buf[500000];
+ int asm_len;
+ 
+@@ -30,6 +32,8 @@
+ int STR_CALL; int STR_RET; int STR_CMP_RCX_RAX; int STR_JE; int STR_JNE;
+ int STR_JL; int STR_JG; int STR_JMP; int STR_LABEL; int STR_COLON;
+ int STR_MOV_RDI; int STR_MOV_RSI; int STR_XOR_RDI_RDI;
++int STR_SHL_RAX;
++int STR_SHR_RAX;
+ int STR_MOV_RAX_60; int STR_SECTION_BSS; int STR_VARS_RESB;
+ int STR_SECTION_TEXT; int STR_GLOBAL_START; int STR_START_COLON;
+ int STR_SYSCALL; int STR_MOV_RAX_1; int STR_MOV_RDI_1; int STR_MOV_RDX_1;
+@@ -105,6 +109,10 @@
+     s = str_buf_len; add_str_char('m'); add_str_char('o'); add_str_char('v'); add_str_char(' '); add_str_char('r'); add_str_char('s'); add_str_char('i'); add_str_char(','); add_str_char(' '); STR_MOV_RSI = make_str(s);
+     s = str_buf_len; add_str_char('x'); add_str_char('o'); add_str_char('r'); add_str_char(' '); add_str_char('r'); add_str_char('d'); add_str_char('i'); add_str_char(','); add_str_char(' '); add_str_char('r'); add_str_char('d'); add_str_char('i'); add_str_char('\n'); STR_XOR_RDI_RDI = make_str(s);
++    
++    s = str_buf_len; add_str_char('s'); add_str_char('h'); add_str_char('l'); add_str_char(' '); add_str_char('r'); add_str_char('a'); add_str_char('x'); add_str_char(','); add_str_char(' '); STR_SHL_RAX = make_str(s);
++    s = str_buf_len; add_str_char('s'); add_str_char('h'); add_str_char('r'); add_str_char(' '); add_str_char('r'); add_str_char('a'); add_str_char('x'); add_str_char(','); add_str_char(' '); STR_SHR_RAX = make_str(s);
++
+     s = str_buf_len; add_str_char('m'); add_str_char('o'); add_str_char('v'); add_str_char(' '); add_str_char('r'); add_str_char('a'); add_str_char('x'); add_str_char(','); add_str_char(' '); add_str_char('6'); add_str_char('0'); add_str_char('\n'); STR_MOV_RAX_60 = make_str(s);
+     s = str_buf_len; add_str_char('s'); add_str_char('e'); add_str_char('c'); add_str_char('t'); add_str_char('i'); add_str_char('o'); add_str_char('n'); add_str_char(' '); add_str_char('.'); add_str_char('b'); add_str_char('s'); add_str_char('s'); add_str_char('\n'); STR_SECTION_BSS = make_str(s);
+     s = str_buf_len; add_str_char('v'); add_str_char('a'); add_str_char('r'); add_str_char('s'); add_str_char(' '); add_str_char('r'); add_str_char('e'); add_str_char('s'); add_str_char('b'); add_str_char(' '); add_str_char('2'); add_str_char('5'); add_str_char('6'); add_str_char('\n'); STR_VARS_RESB = make_str(s);
+@@ -165,9 +173,10 @@
+ 
+ int factor() {
+-    if (token == 258) { emit_str(STR_MOV_RAX); emit_int(token_val); emit_str(STR_NL); next(); }
+-    else if (token == 257) {
++    if (token == 258) { last_was_const = 1; last_const_val = token_val; emit_str(STR_MOV_RAX); emit_int(token_val); emit_str(STR_NL); next(); }
++    else if (token == 257) { last_was_const = 0;
+         int id = find_var(); int offset = 0; int i = 0;
+         while (i < id) { offset = offset + 8; i = i + 1; }
+         emit_str(STR_MOV_RAX); emit_str(STR_MOV_VARS); emit_int(offset); emit_str(STR_BRACKET_NL); next();
+@@ -194,16 +203,66 @@
+         factor();
+         emit_str(STR_MOV_RCX_RSP); emit_str(STR_ADD_RSP);
+         if (op == '*') {
+-            emit_str(STR_MOV_RAX_RCX); // mov rax, rcx
+-            // simplified mul loop emission
+-            emit_str(STR_MOV_RAX); emit_int(0); emit_str(STR_NL); // mov rax, 0
++            if (last_was_const) {
++                int v = last_const_val;
++                if (v == 0) { emit_str(STR_MOV_RAX); emit_int(0); emit_str(STR_NL); }
++                else if (v == 1) { emit_str(STR_MOV_RAX_RCX); emit_str(STR_NL); }
++                else if (v == 2) { emit_str(STR_MOV_RAX_RCX); emit_str(STR_NL); emit_str(STR_SHL_RAX); emit_int(1); emit_str(STR_NL); }
++                else if (v == 3) { emit_str(STR_MOV_RAX_RCX); emit_str(STR_NL); emit_str(STR_SHL_RAX); emit_int(1); emit_str(STR_NL); emit_str(STR_ADD_RAX_RCX); emit_str(STR_NL); }
++                else if (v == 4) { emit_str(STR_MOV_RAX_RCX); emit_str(STR_NL); emit_str(STR_SHL_RAX); emit_int(2); emit_str(STR_NL); }
++                else if (v == 5) { emit_str(STR_MOV_RAX_RCX); emit_str(STR_NL); emit_str(STR_SHL_RAX); emit_int(2); emit_str(STR_NL); emit_str(STR_ADD_RAX_RCX); emit_str(STR_NL); }
++                else if (v == 8) { emit_str(STR_MOV_RAX_RCX); emit_str(STR_NL); emit_str(STR_SHL_RAX); emit_int(3); emit_str(STR_NL); }
++                else if (v == 10) { 
++                    emit_str(STR_MOV_RAX_RCX); emit_str(STR_NL); emit_str(STR_SHL_RAX); emit_int(3); emit_str(STR_NL);
++                    emit_str(STR_SUB_RSP); emit_str(STR_NL); emit_str(STR_MOV_RSP_RAX); emit_str(STR_NL);
++                    emit_str(STR_MOV_RAX_RCX); emit_str(STR_NL); emit_str(STR_SHL_RAX); emit_int(1); emit_str(STR_NL);
++                    emit_str(STR_MOV_RCX_RSP); emit_str(STR_NL); emit_str(STR_ADD_RSP); emit_str(STR_NL); emit_str(STR_ADD_RAX_RCX); emit_str(STR_NL);
++                }
++                else { emit_str(STR_MOV_RAX); emit_int(0); emit_str(STR_NL); }
++            } else { emit_str(STR_MOV_RAX); emit_int(0); emit_str(STR_NL); }
+         } else {
+-            emit_str(STR_MOV_RAX); emit_int(0); emit_str(STR_NL);
++            if (last_was_const) {
++                int v = last_const_val;
++                if (v == 1) { emit_str(STR_MOV_RAX_RCX); emit_str(STR_NL); }
++                else if (v == 2) { emit_str(STR_MOV_RAX_RCX); emit_str(STR_NL); emit_str(STR_SHR_RAX); emit_int(1); emit_str(STR_NL); }
++                else if (v == 4) { emit_str(STR_MOV_RAX_RCX); emit_str(STR_NL); emit_str(STR_SHR_RAX); emit_int(2); emit_str(STR_NL); }
++                else if (v == 8) { emit_str(STR_MOV_RAX_RCX); emit_str(STR_NL); emit_str(STR_SHR_RAX); emit_int(3); emit_str(STR_NL); }
++                else { emit_str(STR_MOV_RAX); emit_int(0); emit_str(STR_NL); }
++            } else { emit_str(STR_MOV_RAX); emit_int(0); emit_str(STR_NL); }
+         }
+     } return 0;
+ }
