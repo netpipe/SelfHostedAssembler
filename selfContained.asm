@@ -1,9 +1,22 @@
 ; ==============================================================================
-; MINI-ASM: A Self-Hosting x86-64 Assembler
+; MINI-ASM: an x86-64 assembler
 ; ==============================================================================
 ; Dialect: Strict subset of NASM/FASM.
 ; Supports: mov, add, sub, cmp, xor, and, jmp, je, jne, jl, jg, call, ret, syscall, db
 ; Registers: rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi
+;
+; REGISTER CONTRACT  (this was the source of most of the original bugs)
+;   r11 = pass mode: 0 = sizing pass, 1 = emit pass
+;   r13 = input read pointer   <- parsers must NEVER write to this
+;   r14 = input end pointer    <- parsers must NEVER write to this
+;   rsi = current opcode-table entry, set by parse_instruction
+;   r12, r15, rbp = parser scratch
+;   Helpers (get_token, is_register, is_number, find_symbol, emit_*) are free to
+;   clobber rax, rbx, rcx, rdx, rdi, r8, r9, r10 and nothing else.
+;
+; Sizes emitted in pass 2 must match the sizes counted in pass 1 exactly, or
+; every label address is wrong. Each parser therefore has ONE `add [pc_vaddr]`
+; per operand form, shared by both passes.
 ; ==============================================================================
 global _start
 
@@ -12,6 +25,11 @@ in_path db "selfHosted.asm", 0
 out_path db "a.out", 0
 err_msg db "Error: ", 10
 err_len equ 8
+unk_msg db "Error: unknown mnemonic: "
+unk_len equ 25
+nl_msg db 10
+sym_msg db "Error: symbol table full", 10
+sym_msg_len equ 25
 
 section .bss
 in_buf resb 65536 ; 64KB input buffer
@@ -24,6 +42,7 @@ out_ptr resq 1
 pc_vaddr resq 1 ; Virtual Program Counter
 sym_cnt resq 1 ; Number of symbols
 mnemonic_buf resb 8 ; Buffer for safe mnemonic parsing
+key_buf resb 8 ; 4-char space-padded lookup key built by word_key
 
 section .text
 
@@ -31,6 +50,8 @@ section .text
 base_vaddr equ 0x400000
 hdr_size equ 120
 code_vaddr equ base_vaddr + hdr_size
+sym_max equ 170 ; sym_tbl is 4096 bytes at 24 bytes per entry (the original
+                ; comment claimed 256, which would have run 2 KB past the table)
 
 ; --- ELF64 HEADER (120 Bytes) ---
 elf_hdr:
@@ -139,6 +160,29 @@ error_exit:
     mov rdi, 1
     syscall
 
+; A word that is neither a known instruction nor a known directive. Reported
+; rather than skipped: silently dropping a line the assembler does not
+; understand produces a binary that is quietly missing instructions.
+unknown_mnemonic:
+    mov rax, 1
+    mov rdi, 2
+    mov rsi, unk_msg
+    mov rdx, unk_len
+    syscall
+    mov rax, 1
+    mov rdi, 2
+    mov rsi, key_buf
+    mov rdx, 4
+    syscall
+    mov rax, 1
+    mov rdi, 2
+    mov rsi, nl_msg
+    mov rdx, 1
+    syscall
+    mov rax, 60
+    mov rdi, 1
+    syscall
+
 ; ==============================================================================
 ; CORE LOGIC
 ; ==============================================================================
@@ -165,18 +209,16 @@ process_line:
     je .inc_ptr
     cmp al, 9
     je .inc_ptr
+    cmp al, 13
+    je .inc_ptr
     cmp al, ';'
     je .skip_to_nl
     cmp al, '%'
     je .skip_to_nl
-    cmp al, 's' ; section
-    je .skip_to_nl
-    cmp al, 'g' ; global
-    je .skip_to_nl
-    cmp al, 'e' ; extern/equ
-    je .skip_to_nl
-    cmp al, 'r' ; resb/resq
-    je .skip_to_nl
+    ; The original tested a SINGLE character here to skip section/global/extern/
+    ; resb, which also threw away every instruction starting with s, g, e or r —
+    ; sub, syscall, ret, shl and shr among them. Directives are now recognised by
+    ; whole word in parse_instruction instead.
     ; Check for label
     mov rdi, r13
     xor rcx, rcx
@@ -186,20 +228,27 @@ process_line:
     je .found_label
     cmp al, ' '
     je .is_instr
+    cmp al, 9
+    je .is_instr
     cmp al, 10
+    je .is_instr
+    cmp al, 13
     je .is_instr
     cmp al, 0
     je .is_instr
     inc rcx
     jmp .scan_label
-    
+
 .found_label:
     call process_label
     jmp .skip_past_label
 
 .is_instr:
     call parse_instruction
-    jmp .next_line
+    ; A parser stops at the end of its operands, not the end of the line. The
+    ; original did a bare `inc r13` here, so a trailing comment or space left
+    ; the rest of the line to be parsed as another instruction.
+    jmp .skip_to_nl
 
 .inc_ptr:
     inc r13
@@ -239,7 +288,25 @@ process_label:
     jmp .len_loop
 .got_len:
     mov rdi, r13
+    jmp add_symbol              ; tail call
+
+; ------------------------------------------------------------------------------
+; add_symbol: record a symbol at the current pc_vaddr.
+;   in: rdi = name, rcx = name length
+; Entry layout (24 bytes): [0] hash, [8] name length, [16] vaddr. The length is
+; stored as well as the hash so that two different names have to collide on BOTH
+; before find_symbol confuses them.
+; Only defined during pass 1; pass 2 would otherwise append a second copy of
+; every symbol and overflow the table.
+; ------------------------------------------------------------------------------
+add_symbol:
+    test r11, r11
+    jnz .done                   ; pass 2: symbols are already known
+    mov rbx, [sym_cnt]
+    cmp rbx, sym_max
+    jge sym_overflow
     call hash_str_token
+    mov r9, rcx                 ; keep the length
     mov rbx, [sym_cnt]
     push rax
     mov rcx, 24
@@ -248,10 +315,22 @@ process_label:
     lea rdi, [sym_tbl + rax]
     pop rax
     mov [rdi], rax
+    mov [rdi+8], r9
     mov rax, [pc_vaddr]
     mov [rdi+16], rax
     inc qword [sym_cnt]
+.done:
     ret
+
+sym_overflow:
+    mov rax, 1
+    mov rdi, 2
+    mov rsi, sym_msg
+    mov rdx, sym_msg_len
+    syscall
+    mov rax, 60
+    mov rdi, 1
+    syscall
 
 hash_str_token:
     mov rax, 5381
@@ -270,32 +349,75 @@ hash_str_token:
 .done:
     ret
 
-parse_instruction:
-    ; Safely copy mnemonic to buffer padded with spaces to handle line endings correctly
-    xor rax, rax
-    mov rcx, 4
-    lea rdi, [mnemonic_buf]
-.copy_loop:
-    mov al, byte [r13]
+; ------------------------------------------------------------------------------
+; word_key: build a 4-character, space-padded lookup key from a word.
+;   in : rdi = first character of the word
+;   out: eax = the key, rdi advanced past the whole word
+; Only rax/rcx/rdi are touched. r13 is deliberately NOT used, so callers can look
+; ahead at a second word without disturbing the read pointer.
+; ------------------------------------------------------------------------------
+word_key:
+    xor rcx, rcx
+.copy:
+    movzx rax, byte [rdi]
     cmp al, 'a'
-    jb .pad_char
+    jb .fill
     cmp al, 'z'
-    ja .pad_char
-    mov byte [rdi], al
+    ja .fill
+    cmp rcx, 4
+    jge .skip_rest
+    mov byte [key_buf + rcx], al
+    inc rcx
     inc rdi
-    inc r13
-    dec rcx
-    jnz .copy_loop
-    jmp .done_copy
-.pad_char:
-    mov byte [rdi], ' '
+    jmp .copy
+.skip_rest:
     inc rdi
-    dec rcx
-    jnz .pad_char
-.done_copy:
-    sub r13, 4 ; Restore r13 to the start of the mnemonic
-    
-    mov eax, [mnemonic_buf]
+    movzx rax, byte [rdi]
+    cmp al, 'a'
+    jb .fill
+    cmp al, 'z'
+    ja .fill
+    jmp .skip_rest
+.fill:
+    cmp rcx, 4
+    jge .done
+    mov byte [key_buf + rcx], ' '
+    inc rcx
+    jmp .fill
+.done:
+    mov eax, [key_buf]
+    ret
+
+; ------------------------------------------------------------------------------
+; is_directive: is eax one of the NASM directives we deliberately ignore?
+;   out: rdx = 1 if yes, 0 if no.  eax preserved.
+; ------------------------------------------------------------------------------
+is_directive:
+    lea r8, [directive_table]
+.loop:
+    cmp dword [r8], eax
+    je .yes
+    cmp dword [r8], '    '
+    je .no
+    add r8, 4
+    jmp .loop
+.yes:
+    mov rdx, 1
+    ret
+.no:
+    xor rdx, rdx
+    ret
+
+parse_instruction:
+    ; Build the mnemonic key WITHOUT moving r13. The original advanced r13 one
+    ; byte per letter copied and then did an unconditional `sub r13, 4`, which
+    ; for any mnemonic shorter than 4 letters left r13 pointing before the
+    ; mnemonic — so the mnemonic was never consumed and came back out of
+    ; get_token as the first operand.
+    mov rdi, r13
+    call word_key
+    mov r12, rdi                ; first char after the mnemonic
+
     lea rsi, [opcode_table]
 .find_loop:
     cmp dword [rsi], eax
@@ -304,83 +426,137 @@ parse_instruction:
     je .not_found
     add rsi, 8
     jmp .find_loop
+
 .found:
-    .skip_mnem:
-        mov al, byte [r13]
-        cmp al, 'a'
-        jb .end_mnem
-        cmp al, 'z'
-        ja .end_mnem
-        inc r13
-        jmp .skip_mnem
-    .end_mnem:
-        movzx r15, byte [rsi + 4]
-        cmp r15, 0
-        je parse_alu
-        cmp r15, 1
-        je parse_mov
-        cmp r15, 2
-        je parse_jmp
-        cmp r15, 3
-        je parse_jcc
-        cmp r15, 4
-        je parse_call
-        cmp r15, 5
-        je parse_ret
-        cmp r15, 6
-        je parse_sys
-        cmp r15, 7
-        je parse_db
-        ret
+    mov r13, r12                ; consume the mnemonic, exactly once
+    movzx r15, byte [rsi + 4]
+    cmp r15, 0
+    je parse_alu
+    cmp r15, 1
+    je parse_mov
+    cmp r15, 2
+    je parse_jmp
+    cmp r15, 3
+    je parse_jcc
+    cmp r15, 4
+    je parse_call
+    cmp r15, 5
+    je parse_ret
+    cmp r15, 6
+    je parse_sys
+    cmp r15, 7
+    je parse_db
+    jmp error_exit              ; table entry with an unknown type
+
 .not_found:
+    ; Not an instruction. Either the line is a directive we ignore ("section
+    ; .text", "global _start"), or the SECOND word is one ("err_len equ 8",
+    ; "in_buf resb 65536"), or it is a data definition ("in_path db ..."), which
+    ; declares a label at the current address. Anything else is a genuine typo
+    ; and must be reported, not silently swallowed.
+    mov dword [mnemonic_buf], eax   ; keep word 1 for the error message
+    call is_directive
+    cmp rdx, 1
+    je .skip
+
+    mov rdi, r12                ; look at the second word
+.skip_ws:
+    movzx rax, byte [rdi]
+    cmp al, ' '
+    je .adv
+    cmp al, 9
+    je .adv
+    jmp .second
+.adv:
+    inc rdi
+    jmp .skip_ws
+.second:
+    call word_key
+    mov r12, rdi                ; first char after word 2
+    cmp eax, 'db  '
+    je .data_label
+    call is_directive
+    cmp rdx, 1
+    je .skip
+    mov eax, [mnemonic_buf]
+    mov dword [key_buf], eax
+    jmp unknown_mnemonic
+.skip:
     ret
+
+.data_label:
+    ; "name db ..." — define name at the current address, then emit the bytes.
+    mov rdi, r13
+    xor rcx, rcx
+.name_len:
+    movzx rax, byte [rdi + rcx]
+    cmp al, ' '
+    je .got_name
+    cmp al, 9
+    je .got_name
+    cmp al, 0
+    je .got_name
+    cmp al, 10
+    je .got_name
+    inc rcx
+    jmp .name_len
+.got_name:
+    call add_symbol
+    mov r13, r12                ; consume "name db"
+    jmp parse_db
 
 ; ==============================================================================
 ; PARSERS
 ; ==============================================================================
+; ALU reg, reg  ->  REX.W <op> /r   (3 bytes)
 parse_alu:
-    movzx r14, byte [rsi + 5]
+    movzx rbp, byte [rsi + 5]   ; opcode. NOT r14: that is the input end pointer
     call get_token
     call is_register
     cmp rax, -1
     je error_exit
-    mov r12, rax
+    mov r12, rax                ; destination register index
     call get_token
     call is_register
     cmp rax, -1
     je error_exit
-    mov r13, rax
-    
+    mov r15, rax                ; source register index. NOT r13: read pointer
+
     test r11, r11
     jz .skip_emit
-    
-    call emit_byte
-    db 0x48
-    mov rdi, r14
+
+    mov rdi, 0x48               ; REX.W. The original wrote a bare `db 0x48`
+    call emit_byte              ; here, which sat in the instruction stream and
+    mov rdi, rbp                ; executed as a prefix instead of being emitted.
     call emit_byte
     mov rdi, r12
     or rdi, 0xC0
-    mov rax, r13
+    mov rax, r15
     shl rax, 3
     or rdi, rax
     call emit_byte
-    
+
 .skip_emit:
     add qword [pc_vaddr], 3
     ret
 
+; mov reg, imm32  ->  REX.W C7 /0 id  (7 bytes)
+; mov reg, reg    ->  REX.W 89 /r     (3 bytes)
+; The two forms are different lengths. The original counted 7 for both, so every
+; label defined after a `mov reg, reg` was placed at the wrong address and every
+; jump/call displacement computed from it was wrong.
 parse_mov:
     call get_token
     call is_register
     cmp rax, -1
     je error_exit
     mov r12, rax
-    
+
     call get_token
     call is_register
     cmp rax, -1
     jne .mov_reg_reg
-    
+
     call find_symbol
     cmp rax, 0
     jne .got_imm
@@ -389,51 +565,51 @@ parse_mov:
     jne .check_pass
     jmp .got_imm
 .check_pass:
+    ; Pass 1 tolerates a forward label reference; by pass 2 it must resolve.
     test r11, r11
     jnz error_exit
     xor rax, rax
 .got_imm:
-    mov r13, rax
-    
-.mov_reg_imm:
+    mov r15, rax
+
     test r11, r11
-    jz .skip_emit
-    
+    jz .size_imm
+
+    mov rdi, 0x48
     call emit_byte
-    db 0x48
+    mov rdi, 0xC7
     call emit_byte
-    db 0xC7
     mov rdi, r12
     or rdi, 0xC0
     call emit_byte
-    mov rdi, r13
+    mov rdi, r15
     call emit_dword
-    
+.size_imm:
     add qword [pc_vaddr], 7
     ret
 
 .mov_reg_reg:
-    mov r13, rax
+    mov r15, rax
     test r11, r11
-    jz .skip_emit
-    
+    jz .size_reg
+
+    mov rdi, 0x48
     call emit_byte
-    db 0x48
+    mov rdi, 0x89
     call emit_byte
-    db 0x89
     mov rdi, r12
     or rdi, 0xC0
-    mov rax, r13
+    mov rax, r15
     shl rax, 3
     or rdi, rax
     call emit_byte
-    
-.skip_emit:
-    add qword [pc_vaddr], 7
+.size_reg:
+    add qword [pc_vaddr], 3
     ret
 
+; jmp rel32  ->  E9 cd  (5 bytes)
 parse_jmp:
-    movzx r14, byte [rsi + 5]
+    movzx rbp, byte [rsi + 5]
     call get_token
     call find_symbol
     cmp rax, 0
@@ -442,23 +618,24 @@ parse_jmp:
     jnz error_exit
 .got_target:
     mov rbx, [pc_vaddr]
-    add rbx, 5
+    add rbx, 5                  ; rel32 is relative to the END of the instruction
     sub rax, rbx
-    
+
     test r11, r11
     jz .skip_emit
-    
-    mov rdi, r14
+
+    mov rdi, rbp
     call emit_byte
     mov rdi, rax
     call emit_dword
-    
+
 .skip_emit:
     add qword [pc_vaddr], 5
     ret
 
+; jcc rel32  ->  0F 8x cd  (6 bytes)
 parse_jcc:
-    movzx r14, byte [rsi + 5]
+    movzx rbp, byte [rsi + 5]
     call get_token
     call find_symbol
     cmp rax, 0
@@ -469,21 +646,22 @@ parse_jcc:
     mov rbx, [pc_vaddr]
     add rbx, 6
     sub rax, rbx
-    
+
     test r11, r11
     jz .skip_emit
-    
+
+    mov rdi, 0x0F
     call emit_byte
-    db 0x0F
-    mov rdi, r14
+    mov rdi, rbp
     call emit_byte
     mov rdi, rax
     call emit_dword
-    
+
 .skip_emit:
     add qword [pc_vaddr], 6
     ret
 
+; call rel32  ->  E8 cd  (5 bytes)
 parse_call:
     call get_token
     call find_symbol
@@ -495,15 +673,15 @@ parse_call:
     mov rbx, [pc_vaddr]
     add rbx, 5
     sub rax, rbx
-    
+
     test r11, r11
     jz .skip_emit
-    
+
+    mov rdi, 0xE8
     call emit_byte
-    db 0xE8
     mov rdi, rax
     call emit_dword
-    
+
 .skip_emit:
     add qword [pc_vaddr], 5
     ret
@@ -511,8 +689,8 @@ parse_call:
 parse_ret:
     test r11, r11
     jz .skip_emit
+    mov rdi, 0xC3
     call emit_byte
-    db 0xC3
 .skip_emit:
     add qword [pc_vaddr], 1
     ret
@@ -520,28 +698,66 @@ parse_ret:
 parse_sys:
     test r11, r11
     jz .skip_emit
+    mov rdi, 0x0F
     call emit_byte
-    db 0x0F
+    mov rdi, 0x05
     call emit_byte
-    db 0x05
 .skip_emit:
     add qword [pc_vaddr], 2
     ret
 
+; db: a comma-separated list of byte values and/or "strings".
+; get_token splits on spaces and commas, so it cannot carry a string containing
+; either; the string case is therefore scanned straight off the read pointer.
 parse_db:
 .db_loop:
+    movzx rax, byte [r13]
+    cmp al, ' '
+    je .adv
+    cmp al, 9
+    je .adv
+    cmp al, ','
+    je .adv
+    cmp al, 13
+    je .adv
+    cmp al, 10
+    je .db_done
+    cmp al, 0
+    je .db_done
+    cmp al, ';'
+    je .db_done
+    cmp al, '"'
+    je .string
     call get_token
     cmp rcx, 0
     je .db_done
     call is_number
     cmp rdx, 1
-    jne .db_done
-    test r11, r11
-    jz .skip_emit
+    jne error_exit
+    mov rdi, rax
+    call emit_byte              ; emit_byte is a no-op during the sizing pass
+    add qword [pc_vaddr], 1
+    jmp .db_loop
+.adv:
+    inc r13
+    jmp .db_loop
+.string:
+    inc r13                     ; past the opening quote
+.str_loop:
+    movzx rax, byte [r13]
+    cmp al, '"'
+    je .str_end
+    cmp al, 0
+    je error_exit               ; unterminated string
+    cmp al, 10
+    je error_exit
     mov rdi, rax
     call emit_byte
-.skip_emit:
     add qword [pc_vaddr], 1
+    inc r13
+    jmp .str_loop
+.str_end:
+    inc r13
     jmp .db_loop
 .db_done:
     ret
@@ -621,14 +837,25 @@ is_register:
 .no_reg:
     mov rax, -1
     ret
-.r0: mov eax, 0 ; ret
-.r1: mov eax, 1 ; ret
-.r2: mov eax, 2 ; ret
-.r3: mov eax, 3 ; ret
-.r4: mov eax, 4 ; ret
-.r5: mov eax, 5 ; ret
-.r6: mov eax, 6 ; ret
-.r7: mov eax, 7 ; ret
+; Every one of these used to read `.rN: mov eax, N ; ret` — the semicolon made
+; the ret a comment, so .r0 fell through .r1 .. .r7 and out of the function into
+; is_number. All eight register names resolved to the same value.
+.r0: mov eax, 0
+    ret
+.r1: mov eax, 1
+    ret
+.r2: mov eax, 2
+    ret
+.r3: mov eax, 3
+    ret
+.r4: mov eax, 4
+    ret
+.r5: mov eax, 5
+    ret
+.r6: mov eax, 6
+    ret
+.r7: mov eax, 7
+    ret
 
 is_number:
     xor rax, rax
@@ -687,6 +914,9 @@ is_number:
     mov rdx, 0
     ret
 
+; find_symbol must leave rdi and rcx (the token) intact, because parse_mov calls
+; is_number straight afterwards when the lookup misses. The original used rcx as
+; its loop scratch, so the token length was destroyed on the way through.
 find_symbol:
     call hash_str_token
     mov rbx, [sym_cnt]
@@ -694,11 +924,14 @@ find_symbol:
 .sym_loop:
     cmp r9, rbx
     jge .not_found
-    mov rcx, r9
-    imul rcx, 24
-    lea r8, [sym_tbl + rcx]
+    mov r10, r9
+    imul r10, 24
+    lea r8, [sym_tbl + r10]
     mov r10, [r8]
     cmp r10, rax
+    jne .next_sym
+    mov r10, [r8 + 8]           ; hashes match; the lengths must too
+    cmp r10, rcx
     jne .next_sym
     mov rax, [r8 + 16]
     ret
@@ -749,6 +982,27 @@ opcode_table:
     db "sys ", 6, 0x0F, 0x05, 0
     db "db  ", 7, 0, 0, 0
     db "    ", 0, 0, 0, 0 ; terminator
+
+; NASM directives that are recognised and ignored, matched as whole words. Four
+; bytes each, space padded, same key format as the opcode table.
+align 4
+directive_table:
+    db "sect"          ; section
+    db "glob"          ; global
+    db "extr"          ; extern
+    db "alig"          ; align
+    db "bits"
+    db "org "
+    db "equ "
+    db "resb"
+    db "resw"
+    db "resd"
+    db "resq"
+    db "dw  "
+    db "dd  "
+    db "dq  "
+    db "time"          ; times
+    db "    "          ; terminator
 
 ; --- DEMO PROGRAM (This block is assembled by the tool itself) ---
 demo_start:
