@@ -6,11 +6,14 @@
 ; Instructions: mov, add, or, and, sub, xor, cmp, shl, shr, sar,
 ;               jmp, je/jz, jne/jnz, jl, jle, jg, jge, jb, jbe, ja, jae, js, jns,
 ;               call, ret, syscall, db
-; Registers:    rax rcx rdx rbx rsp rbp rsi rdi r8..r15
+; Registers:    rax rcx rdx rbx rsp rbp rsi rdi r8..r15, and al cl dl bl
 ; Operands:     reg · imm32 · label
 ;               [reg] · [reg + N] · [reg - N] · [rip + label] · [label]
-; Not supported: [base + index], scaled indexes, 8/16/32-bit operand sizes,
-;               and an immediate written to memory.
+; Byte access:  mov al, [mem] and mov [mem], al (also cl, dl, bl). Required:
+;               a 1-byte store cannot be synthesised from 8-byte operations
+;               without touching memory the program may not own.
+; Not supported: [base + index], scaled indexes, 16/32-bit operand sizes,
+;               ah/ch/dh/bh, and an immediate written to memory.
 ;
 ; REGISTER CONTRACT  (this was the source of most of the original bugs)
 ;   r11 = pass mode: 0 = sizing pass, 1 = emit pass
@@ -37,11 +40,13 @@ unk_len equ 25
 nl_msg db 10
 sym_msg db "Error: symbol table full", 10
 sym_msg_len equ 25
+big_msg db "Error: input larger than the buffer", 10
+big_len equ 36
 
 section .bss
-in_buf resb 65536 ; 64KB input buffer
-out_buf resb 65536 ; 64KB output buffer
-sym_tbl resb 4096 ; Symbol table (max 256 labels)
+in_buf resb 1048576 ; 1MB input buffer
+out_buf resb 1048576 ; 1MB output buffer
+sym_tbl resb 65536 ; symbol table
 in_fd resq 1
 out_fd resq 1
 in_size resq 1
@@ -55,9 +60,12 @@ key_buf resb 8 ; 4-char space-padded lookup key built by word_key
 ;   +8  register index 0-15 (kind 0), or the memory base register (kind 1)
 ;   +16 displacement (kind 1) or immediate value (kind 2)
 ;   +24 1 if the memory operand is RIP-relative
-opA resb 32
-opB resb 32
+;   +32 operand size in bytes: 8 (default) or 1 (al/cl/dl/bl)
+opA resb 40
+opB resb 40
 alu_digit resq 1 ; ModRM /digit for the immediate and shift forms
+reg_size resq 1  ; size of the register is_register last recognised
+rex_w resq 1     ; 1 = emit REX.W, 0 = 8-bit operand, REX only if needed
 
 section .text
 
@@ -65,8 +73,10 @@ section .text
 base_vaddr equ 0x400000
 hdr_size equ 120
 code_vaddr equ base_vaddr + hdr_size
-sym_max equ 170 ; sym_tbl is 4096 bytes at 24 bytes per entry (the original
-                ; comment claimed 256, which would have run 2 KB past the table)
+sym_max equ 2730 ; sym_tbl is 65536 bytes at 24 bytes per entry. The original
+                 ; reserved 4096 bytes and claimed 256 entries, which would have
+                 ; run 2 KB past the end of the table.
+buf_size equ 1048576
 
 ; --- ELF64 HEADER (120 Bytes) ---
 elf_hdr:
@@ -86,7 +96,8 @@ dw 0 ; e_shnum
 dw 0 ; e_shstrndx
 phdr:
 dd 1 ; p_type = PT_LOAD
-dd 5 ; p_flags = PF_R | PF_X
+dd 7 ; p_flags = PF_R | PF_W | PF_X  (data lives in the same segment,
+     ; so without PF_W any write to a global faults)
 dq 0 ; p_offset
 dq base_vaddr ; p_vaddr
 dq base_vaddr ; p_paddr
@@ -108,9 +119,13 @@ _start:
     mov rax, 0 ; sys_read
     mov rdi, [in_fd]
     mov rsi, in_buf
-    mov rdx, 65536
+    mov rdx, buf_size
     syscall
     mov [in_size], rax
+    ; A short buffer would silently assemble the first N bytes and drop the
+    ; rest, which is far worse than refusing.
+    cmp rax, buf_size
+    jge input_too_big
     mov rax, 3 ; sys_close
     mov rdi, [in_fd]
     syscall
@@ -170,6 +185,16 @@ error_exit:
     mov rdi, 2 ; stderr
     mov rsi, err_msg
     mov rdx, err_len
+    syscall
+    mov rax, 60
+    mov rdi, 1
+    syscall
+
+input_too_big:
+    mov rax, 1
+    mov rdi, 2
+    mov rsi, big_msg
+    mov rdx, big_len
     syscall
     mov rax, 60
     mov rdi, 1
@@ -589,6 +614,7 @@ parse_operand:
     mov qword [r15 + 8], 0
     mov qword [r15 + 16], 0
     mov qword [r15 + 24], 0
+    mov qword [r15 + 32], 8
 .skip:
     movzx rax, byte [r13]
     cmp al, ' '
@@ -611,6 +637,8 @@ parse_operand:
     je .not_reg
     mov qword [r15], 0          ; kind = register
     mov [r15 + 8], rax
+    mov rax, [reg_size]
+    mov [r15 + 32], rax
     ret
 .not_reg:
     call find_symbol
@@ -745,24 +773,34 @@ parse_operand:
 ; ------------------------------------------------------------------------------
 encode_rm:
     ; ---- REX ----
+    ; For a 64-bit operand REX.W is mandatory. For an 8-bit operand there is no
+    ; REX at all unless an extended register forces one.
+    xor r10, r10
+    cmp qword [rex_w], 0
+    je .rex_optional
     mov r10, 0x48
+.rex_optional:
     mov rax, r12
     cmp rax, 8
     jl .no_rex_r
-    or r10, 4                   ; REX.R
+    or r10, 0x44                ; REX.R (with the 0x40 base)
 .no_rex_r:
     mov rax, [r15 + 8]
     cmp qword [r15 + 24], 1
     je .no_rex_b                ; RIP-relative has no base register
     cmp rax, 8
     jl .no_rex_b
-    or r10, 1                   ; REX.B
+    or r10, 0x41                ; REX.B
 .no_rex_b:
+    cmp r10, 0
+    je .no_rex
     mov rdi, r10
     call emit_byte
+    add qword [pc_vaddr], 1
+.no_rex:
     mov rdi, rbp
     call emit_byte
-    add qword [pc_vaddr], 2
+    add qword [pc_vaddr], 1
 
     mov r9, r12
     and r9, 7
@@ -864,6 +902,7 @@ encode_rm:
 ;   reg, imm32   REX.W 81 /d id
 ; ------------------------------------------------------------------------------
 parse_alu:
+    mov qword [rex_w], 1
     movzx rbp, byte [rsi + 5]   ; base opcode
     movzx rax, byte [rsi + 6]   ; /digit for the immediate forms
     mov [alu_digit], rax        ; NOT r14: that is the input end pointer
@@ -953,10 +992,19 @@ parse_alu:
 ;   reg, mem     REX.W 8B /r
 ; ------------------------------------------------------------------------------
 parse_mov:
+    mov qword [rex_w], 1
     mov rdi, opA
     call parse_operand
     mov rdi, opB
     call parse_operand
+
+    ; A byte-sized register on either side selects the 8-bit opcodes and drops
+    ; REX.W. Needed for char loads and stores: a 1-byte store cannot be
+    ; synthesised from 8-byte operations without reading memory you may not own.
+    cmp qword [opA + 32], 1
+    je .byte_form
+    cmp qword [opB + 32], 1
+    je .byte_form
 
     cmp qword [opB], 2
     je .imm_form
@@ -971,6 +1019,22 @@ parse_mov:
 
 .from_mem:
     mov rbp, 0x8B
+    mov r12, [opA + 8]
+    mov r15, opB
+    jmp encode_rm
+
+.byte_form:
+    mov qword [rex_w], 0
+    cmp qword [opB], 1
+    je .byte_from_mem
+    ; r/m8 <- reg8
+    mov rbp, 0x88
+    mov r12, [opB + 8]
+    mov r15, opA
+    jmp encode_rm
+.byte_from_mem:
+    ; reg8 <- r/m8
+    mov rbp, 0x8A
     mov r12, [opA + 8]
     mov r15, opB
     jmp encode_rm
@@ -991,6 +1055,7 @@ parse_mov:
 ;   reg, cl      REX.W D3 /d
 ; ------------------------------------------------------------------------------
 parse_shift:
+    mov qword [rex_w], 1
     movzx rax, byte [rsi + 5]   ; /digit: 4 = shl, 5 = shr, 7 = sar
     mov [alu_digit], rax
     mov rdi, opA
@@ -1241,6 +1306,7 @@ get_token:
     ret
 
 is_register:
+    mov qword [reg_size], 8
     cmp rcx, 2
     je .two
     cmp rcx, 3
@@ -1284,6 +1350,16 @@ is_register:
     je .r8
     cmp ax, 'r9'
     je .r9
+    ; The four byte registers that need no REX prefix. ah/ch/dh/bh are not
+    ; supported: without REX, indexes 4-7 mean those rather than spl/bpl/sil/dil.
+    cmp ax, 'al'
+    je .b0
+    cmp ax, 'cl'
+    je .b1
+    cmp ax, 'dl'
+    je .b2
+    cmp ax, 'bl'
+    je .b3
 .no_reg:
     mov rax, -1
     ret
@@ -1322,12 +1398,36 @@ is_register:
     ret
 .r15: mov eax, 15
     ret
+.b0: mov qword [reg_size], 1
+    mov eax, 0
+    ret
+.b1: mov qword [reg_size], 1
+    mov eax, 1
+    ret
+.b2: mov qword [reg_size], 1
+    mov eax, 2
+    ret
+.b3: mov qword [reg_size], 1
+    mov eax, 3
+    ret
 
 is_number:
     xor rax, rax
     xor rdx, rdx
+    xor r8, r8                  ; negative?
     cmp rcx, 0
     je .done
+    ; A leading minus was not handled at all, so `xor rax, -1` - which is how a
+    ; minimal-instruction-set compiler writes `not` - failed to parse.
+    movzx rbx, byte [rdi]
+    cmp bl, '-'
+    jne .nosign
+    mov r8, 1
+    inc rdi
+    dec rcx
+    cmp rcx, 0
+    je .invalid                 ; a lone "-" is not a number
+.nosign:
     cmp rcx, 2
     jl .dec
     cmp word [rdi], '0x'
@@ -1374,6 +1474,12 @@ is_number:
     inc rdi
     jmp .hex_loop
 .done:
+    cmp r8, 0
+    je .positive
+    mov rbx, 0
+    sub rbx, rax
+    mov rax, rbx
+.positive:
     mov rdx, 1
     ret
 .invalid:
