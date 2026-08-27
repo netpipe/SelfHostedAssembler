@@ -66,6 +66,7 @@ opB resb 40
 alu_digit resq 1 ; ModRM /digit for the immediate and shift forms
 reg_size resq 1  ; size of the register is_register last recognised
 rex_w resq 1     ; 1 = emit REX.W, 0 = 8-bit operand, REX only if needed
+data_size resq 1 ; element width for dw/dd/dq: 2, 4 or 8 (0 selects db)
 
 section .text
 
@@ -488,7 +489,14 @@ parse_instruction:
     je parse_db
     cmp r15, 8
     je parse_shift
+    cmp r15, 9
+    je .data_dir
     jmp error_exit              ; table entry with an unknown type
+
+.data_dir:
+    movzx rax, byte [rsi + 6]   ; element width, 2 / 4 / 8
+    mov qword [data_size], rax
+    jmp parse_data
 
 .not_found:
     ; Not an instruction. Either the line is a directive we ignore ("section
@@ -515,7 +523,17 @@ parse_instruction:
 .second:
     call word_key
     mov r12, rdi                ; first char after word 2
+    mov qword [data_size], 0    ; 0 selects parse_db (bytes, strings allowed)
     cmp eax, 'db  '
+    je .data_label
+    mov qword [data_size], 2
+    cmp eax, 'dw  '
+    je .data_label
+    mov qword [data_size], 4
+    cmp eax, 'dd  '
+    je .data_label
+    mov qword [data_size], 8
+    cmp eax, 'dq  '
     je .data_label
     call is_directive
     cmp rdx, 1
@@ -544,8 +562,10 @@ parse_instruction:
     jmp .name_len
 .got_name:
     call add_symbol
-    mov r13, r12                ; consume "name db"
-    jmp parse_db
+    mov r13, r12                ; consume "name db" / "name dq" / ...
+    cmp qword [data_size], 0
+    je parse_db
+    jmp parse_data
 
 ; ==============================================================================
 ; PARSERS
@@ -698,7 +718,7 @@ parse_operand:
     xor rax, rax
 .rip_got:
     mov [r15 + 16], rax         ; absolute target address
-    jmp .close
+    jmp .label_disp
 
 .label_form:
     ; [label] - treated as RIP-relative, same as [rip + label]
@@ -711,6 +731,41 @@ parse_operand:
     xor rax, rax
 .label_got:
     mov [r15 + 16], rax
+    ; fall through: a label may carry a displacement too
+
+; An optional +N / -N after a label, as in [nums + 8]. This used to jump
+; straight to .close, so the displacement was parsed by nobody and silently
+; dropped -- [nums + 8] assembled as [nums]. It produced a working binary that
+; read the wrong field, which is why only the byte comparison caught it.
+.label_disp:
+    movzx rax, byte [r13]
+    cmp al, ' '
+    je .label_disp_adv
+    cmp al, 9
+    je .label_disp_adv
+    cmp al, '+'
+    je .label_disp_plus
+    cmp al, '-'
+    je .label_disp_minus
+    jmp .close
+.label_disp_adv:
+    inc r13
+    jmp .label_disp
+.label_disp_plus:
+    inc r13
+    call mem_token
+    call is_number
+    cmp rdx, 1
+    jne error_exit
+    add [r15 + 16], rax
+    jmp .close
+.label_disp_minus:
+    inc r13
+    call mem_token
+    call is_number
+    cmp rdx, 1
+    jne error_exit
+    sub [r15 + 16], rax
     jmp .close
 
 .disp:
@@ -1254,6 +1309,72 @@ parse_db:
 .db_done:
     ret
 
+; ------------------------------------------------------------------------------
+; dw / dd / dq: a comma-separated list of numbers and/or symbol addresses, each
+; emitted little-endian in [data_size] bytes.
+;
+; A symbol is tried before a number because a data list is mostly labels, and
+; find_symbol leaves rdi/rcx alone so is_number can still see the same token.
+;
+; Registers: r12 = value being shifted out, r15 = width, rbp = byte counter.
+; rbp is used for the counter rather than r10 because helpers are free to
+; clobber r10 and emit_byte is called from inside the loop.
+; ------------------------------------------------------------------------------
+parse_data:
+.loop:
+    movzx rax, byte [r13]
+    cmp al, ' '
+    je .adv
+    cmp al, 9
+    je .adv
+    cmp al, ','
+    je .adv
+    cmp al, 13
+    je .adv
+    cmp al, 10
+    je .done
+    cmp al, 0
+    je .done
+    cmp al, ';'
+    je .done
+    call get_token
+    cmp rcx, 0
+    je .done
+    call find_symbol
+    cmp rax, 0
+    jne .emit
+    call is_number
+    cmp rdx, 1
+    je .emit
+    ; Neither a number nor a symbol we know yet. During the sizing pass that is
+    ; simply a forward reference -- `pp: dq msg` with msg defined further down
+    ; is the normal case -- so emit a placeholder and let pass 2 resolve it.
+    ; During the emit pass the symbol really is undefined.
+    test r11, r11
+    jnz error_exit
+    xor rax, rax
+.emit:
+    mov r12, rax
+    mov r15, [data_size]
+    xor rbp, rbp
+.byte_loop:
+    cmp rbp, r15
+    jge .advance_pc
+    mov rdi, r12
+    call emit_byte              ; a no-op during the sizing pass
+    shr r12, 8
+    inc rbp
+    jmp .byte_loop
+.advance_pc:
+    mov rax, [data_size]
+    add qword [pc_vaddr], rax
+    jmp .loop
+.adv:
+    inc r13
+    jmp .loop
+.done:
+    ret
+
 ; ==============================================================================
 ; HELPERS
 ; ==============================================================================
@@ -1568,6 +1689,9 @@ opcode_table:
     db "sysc", 6, 0x0F, 0x05, 0
     db "sys ", 6, 0x0F, 0x05, 0
     db "db  ", 7, 0, 0, 0
+    db "dw  ", 9, 0, 2, 0   ; element width lives in the /digit byte
+    db "dd  ", 9, 0, 4, 0
+    db "dq  ", 9, 0, 8, 0
     db "    ", 0, 0, 0, 0 ; terminator
 
 ; NASM directives that are recognised and ignored, matched as whole words. Four
@@ -1585,9 +1709,9 @@ directive_table:
     db "resw"
     db "resd"
     db "resq"
-    db "dw  "
-    db "dd  "
-    db "dq  "
+    ; dw / dd / dq are NO LONGER ignored -- they are real data directives now,
+    ; handled by parse_data. Leaving them here made `pp: dq msg` emit nothing
+    ; and skip pc_vaddr, so pp silently aliased whatever label came next.
     db "time"          ; times
     db "    "          ; terminator
 
