@@ -2,8 +2,15 @@
 ; MINI-ASM: an x86-64 assembler
 ; ==============================================================================
 ; Dialect: Strict subset of NASM/FASM.
-; Supports: mov, add, sub, cmp, xor, and, jmp, je, jne, jl, jg, call, ret, syscall, db
-; Registers: rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi
+;
+; Instructions: mov, add, or, and, sub, xor, cmp, shl, shr, sar,
+;               jmp, je/jz, jne/jnz, jl, jle, jg, jge, jb, jbe, ja, jae, js, jns,
+;               call, ret, syscall, db
+; Registers:    rax rcx rdx rbx rsp rbp rsi rdi r8..r15
+; Operands:     reg · imm32 · label
+;               [reg] · [reg + N] · [reg - N] · [rip + label] · [label]
+; Not supported: [base + index], scaled indexes, 8/16/32-bit operand sizes,
+;               and an immediate written to memory.
 ;
 ; REGISTER CONTRACT  (this was the source of most of the original bugs)
 ;   r11 = pass mode: 0 = sizing pass, 1 = emit pass
@@ -43,6 +50,14 @@ pc_vaddr resq 1 ; Virtual Program Counter
 sym_cnt resq 1 ; Number of symbols
 mnemonic_buf resb 8 ; Buffer for safe mnemonic parsing
 key_buf resb 8 ; 4-char space-padded lookup key built by word_key
+; Two parsed-operand slots. Layout, 32 bytes each:
+;   +0  kind: 0 = register, 1 = memory, 2 = immediate
+;   +8  register index 0-15 (kind 0), or the memory base register (kind 1)
+;   +16 displacement (kind 1) or immediate value (kind 2)
+;   +24 1 if the memory operand is RIP-relative
+opA resb 32
+opB resb 32
+alu_digit resq 1 ; ModRM /digit for the immediate and shift forms
 
 section .text
 
@@ -446,6 +461,8 @@ parse_instruction:
     je parse_sys
     cmp r15, 7
     je parse_db
+    cmp r15, 8
+    je parse_shift
     jmp error_exit              ; table entry with an unknown type
 
 .not_found:
@@ -508,104 +525,514 @@ parse_instruction:
 ; ==============================================================================
 ; PARSERS
 ; ==============================================================================
-; ALU reg, reg  ->  REX.W <op> /r   (3 bytes)
-parse_alu:
-    movzx rbp, byte [rsi + 5]   ; opcode. NOT r14: that is the input end pointer
-    call get_token
-    call is_register
-    cmp rax, -1
-    je error_exit
-    mov r12, rax                ; destination register index
-    call get_token
-    call is_register
-    cmp rax, -1
-    je error_exit
-    mov r15, rax                ; source register index. NOT r13: read pointer
+;
+; A2: operands are parsed into the opA / opB slots by parse_operand, and encoded
+; by encode_rm, which is shared by mov and all six ALU ops. Supported forms:
+;
+;   reg                      rax..rdi, r8..r15
+;   imm / label
+;   [reg]                    [rax] [rsp] [rbp] ...
+;   [reg + N]  [reg - N]     [rbp - 8]
+;   [rip + label]  [label]   RIP-relative, always disp32
+;
+; Not supported, and documented as such: [base + index], scaled indexes,
+; 8/16/32-bit operand sizes, and memory destinations for an immediate.
 
-    test r11, r11
-    jz .skip_emit
-
-    mov rdi, 0x48               ; REX.W. The original wrote a bare `db 0x48`
-    call emit_byte              ; here, which sat in the instruction stream and
-    mov rdi, rbp                ; executed as a prefix instead of being emitted.
-    call emit_byte
-    mov rdi, r12
-    or rdi, 0xC0
-    mov rax, r15
-    shl rax, 3
-    or rdi, rax
-    call emit_byte
-
-.skip_emit:
-    add qword [pc_vaddr], 3
+; ------------------------------------------------------------------------------
+; mem_token: read one word of a memory operand off r13.
+;   out: rdi = start, rcx = length, r13 advanced past it
+; Stops on space, tab, '+', '-' and ']' — get_token cannot be used here because
+; it splits on commas and would swallow the bracket.
+; ------------------------------------------------------------------------------
+mem_token:
+.skip:
+    movzx rax, byte [r13]
+    cmp al, ' '
+    je .adv
+    cmp al, 9
+    je .adv
+    jmp .start
+.adv:
+    inc r13
+    jmp .skip
+.start:
+    mov rdi, r13
+    xor rcx, rcx
+.scan:
+    movzx rax, byte [r13 + rcx]
+    cmp al, ' '
+    je .done
+    cmp al, 9
+    je .done
+    cmp al, '+'
+    je .done
+    cmp al, '-'
+    je .done
+    cmp al, ']'
+    je .done
+    cmp al, 0
+    je .done
+    cmp al, 10
+    je .done
+    inc rcx
+    jmp .scan
+.done:
+    add r13, rcx
     ret
 
-; mov reg, imm32  ->  REX.W C7 /0 id  (7 bytes)
-; mov reg, reg    ->  REX.W 89 /r     (3 bytes)
-; The two forms are different lengths. The original counted 7 for both, so every
-; label defined after a `mov reg, reg` was placed at the wrong address and every
-; jump/call displacement computed from it was wrong.
-parse_mov:
-    call get_token
-    call is_register
-    cmp rax, -1
-    je error_exit
-    mov r12, rax
+; ------------------------------------------------------------------------------
+; parse_operand: parse one operand at r13 into the slot whose base is in rdi.
+; ------------------------------------------------------------------------------
+parse_operand:
+    mov r15, rdi
+    mov qword [r15], 0
+    mov qword [r15 + 8], 0
+    mov qword [r15 + 16], 0
+    mov qword [r15 + 24], 0
+.skip:
+    movzx rax, byte [r13]
+    cmp al, ' '
+    je .adv
+    cmp al, 9
+    je .adv
+    cmp al, ','
+    je .adv
+    jmp .start
+.adv:
+    inc r13
+    jmp .skip
+.start:
+    cmp al, '['
+    je .mem
 
     call get_token
     call is_register
     cmp rax, -1
-    jne .mov_reg_reg
-
+    je .not_reg
+    mov qword [r15], 0          ; kind = register
+    mov [r15 + 8], rax
+    ret
+.not_reg:
     call find_symbol
     cmp rax, 0
-    jne .got_imm
+    jne .imm
     call is_number
     cmp rdx, 1
-    jne .check_pass
-    jmp .got_imm
-.check_pass:
-    ; Pass 1 tolerates a forward label reference; by pass 2 it must resolve.
+    je .imm
+    ; A label not yet defined. Tolerated in pass 1, an error by pass 2.
     test r11, r11
     jnz error_exit
     xor rax, rax
-.got_imm:
-    mov r15, rax
+.imm:
+    mov qword [r15], 2          ; kind = immediate
+    mov [r15 + 16], rax
+    ret
 
+.mem:
+    inc r13                     ; past '['
+    mov qword [r15], 1          ; kind = memory
+    call mem_token
+    cmp rcx, 3
+    jne .base_sym
+    mov eax, [rdi]
+    and eax, 0x00FFFFFF
+    cmp eax, 'rip'
+    je .rip_form
+.base_sym:
+    call is_register
+    cmp rax, -1
+    je .label_form
+    mov [r15 + 8], rax          ; base register
+    jmp .disp
+
+.rip_form:
+    mov qword [r15 + 24], 1
+    ; expect "+ label"
+.rip_skip:
+    movzx rax, byte [r13]
+    cmp al, ' '
+    je .rip_adv
+    cmp al, 9
+    je .rip_adv
+    cmp al, '+'
+    je .rip_adv
+    jmp .rip_word
+.rip_adv:
+    inc r13
+    jmp .rip_skip
+.rip_word:
+    call mem_token
+    call find_symbol
+    cmp rax, 0
+    jne .rip_got
     test r11, r11
-    jz .size_imm
+    jnz error_exit
+    xor rax, rax
+.rip_got:
+    mov [r15 + 16], rax         ; absolute target address
+    jmp .close
 
-    mov rdi, 0x48
+.label_form:
+    ; [label] - treated as RIP-relative, same as [rip + label]
+    mov qword [r15 + 24], 1
+    call find_symbol
+    cmp rax, 0
+    jne .label_got
+    test r11, r11
+    jnz error_exit
+    xor rax, rax
+.label_got:
+    mov [r15 + 16], rax
+    jmp .close
+
+.disp:
+    movzx rax, byte [r13]
+    cmp al, ' '
+    je .disp_adv
+    cmp al, 9
+    je .disp_adv
+    cmp al, ']'
+    je .close
+    cmp al, '+'
+    je .disp_plus
+    cmp al, '-'
+    je .disp_minus
+    jmp error_exit
+.disp_adv:
+    inc r13
+    jmp .disp
+.disp_plus:
+    inc r13
+    call mem_token
+    call is_number
+    cmp rdx, 1
+    jne error_exit
+    mov [r15 + 16], rax
+    jmp .close
+.disp_minus:
+    inc r13
+    call mem_token
+    call is_number
+    cmp rdx, 1
+    jne error_exit
+    mov rbx, 0
+    sub rbx, rax
+    mov [r15 + 16], rbx
+    jmp .close
+
+.close:
+    movzx rax, byte [r13]
+    cmp al, ']'
+    je .close_done
+    cmp al, 0
+    je error_exit
+    cmp al, 10
+    je error_exit
+    inc r13
+    jmp .close
+.close_done:
+    inc r13
+    ret
+
+; ------------------------------------------------------------------------------
+; encode_rm: emit  REX.W <opcode> ModRM [SIB] [disp]
+;   rbp = opcode byte
+;   r12 = the "reg" field (a register index 0-15)
+;   r15 = slot base of the r/m operand (register or memory)
+; Advances pc_vaddr by the exact size. Sizes depend only on operand shape and on
+; displacement literals, both of which are known in pass 1, so the two passes
+; always agree.
+; ------------------------------------------------------------------------------
+encode_rm:
+    ; ---- REX ----
+    mov r10, 0x48
+    mov rax, r12
+    cmp rax, 8
+    jl .no_rex_r
+    or r10, 4                   ; REX.R
+.no_rex_r:
+    mov rax, [r15 + 8]
+    cmp qword [r15 + 24], 1
+    je .no_rex_b                ; RIP-relative has no base register
+    cmp rax, 8
+    jl .no_rex_b
+    or r10, 1                   ; REX.B
+.no_rex_b:
+    mov rdi, r10
     call emit_byte
-    mov rdi, 0xC7
+    mov rdi, rbp
     call emit_byte
-    mov rdi, r12
-    or rdi, 0xC0
+    add qword [pc_vaddr], 2
+
+    mov r9, r12
+    and r9, 7
+    shl r9, 3                   ; reg field, already shifted into place
+
+    cmp qword [r15], 1
+    je .mem
+    ; ---- register direct: mod = 11 ----
+    mov rax, [r15 + 8]
+    and rax, 7
+    or rax, r9
+    or rax, 0xC0
+    mov rdi, rax
     call emit_byte
-    mov rdi, r15
+    add qword [pc_vaddr], 1
+    ret
+
+.mem:
+    cmp qword [r15 + 24], 1
+    je .rip
+
+    mov rbx, [r15 + 8]          ; base register
+    mov r8, rbx
+    and r8, 7                   ; low 3 bits = rm field
+    mov rdx, [r15 + 16]         ; displacement
+
+    ; mod selection. rbp and r13 (rm == 5) cannot use mod=00: that encoding
+    ; means RIP-relative in 64-bit mode, so they always carry a displacement.
+    test rdx, rdx
+    jnz .need_disp
+    cmp r8, 5
+    je .need_disp
+    xor rcx, rcx                ; mod = 00
+    jmp .emit_modrm
+.need_disp:
+    mov rax, rdx
+    cmp rax, 127
+    jg .disp32
+    cmp rax, -128
+    jl .disp32
+    mov rcx, 0x40               ; mod = 01, disp8
+    jmp .emit_modrm
+.disp32:
+    mov rcx, 0x80               ; mod = 10, disp32
+
+.emit_modrm:
+    mov rax, r8
+    or rax, r9
+    or rax, rcx
+    mov rdi, rax
+    call emit_byte
+    add qword [pc_vaddr], 1
+
+    ; rsp and r12 (rm == 4) need a SIB byte selecting "base, no index"
+    cmp r8, 4
+    jne .no_sib
+    mov rdi, 0x24
+    call emit_byte
+    add qword [pc_vaddr], 1
+.no_sib:
+    cmp rcx, 0x40
+    je .emit_d8
+    cmp rcx, 0x80
+    je .emit_d32
+    ret
+.emit_d8:
+    mov rdi, rdx
+    call emit_byte
+    add qword [pc_vaddr], 1
+    ret
+.emit_d32:
+    mov rdi, rdx
     call emit_dword
-.size_imm:
-    add qword [pc_vaddr], 7
+    add qword [pc_vaddr], 4
     ret
 
-.mov_reg_reg:
-    mov r15, rax
-    test r11, r11
-    jz .size_reg
+.rip:
+    ; mod = 00, rm = 101, disp32 relative to the end of the instruction
+    mov rax, 5
+    or rax, r9
+    mov rdi, rax
+    call emit_byte
+    add qword [pc_vaddr], 1
+    mov rax, [r15 + 16]
+    mov rbx, [pc_vaddr]
+    add rbx, 4                  ; the disp32 itself
+    sub rax, rbx
+    mov rdi, rax
+    call emit_dword
+    add qword [pc_vaddr], 4
+    ret
 
+; ------------------------------------------------------------------------------
+; ALU: add / or / and / sub / xor / cmp
+;   reg, reg     REX.W <op>   /r
+;   mem, reg     REX.W <op>   /r
+;   reg, mem     REX.W <op+2> /r
+;   reg, imm8    REX.W 83 /d ib
+;   reg, imm32   REX.W 81 /d id
+; ------------------------------------------------------------------------------
+parse_alu:
+    movzx rbp, byte [rsi + 5]   ; base opcode
+    movzx rax, byte [rsi + 6]   ; /digit for the immediate forms
+    mov [alu_digit], rax        ; NOT r14: that is the input end pointer
+    mov rdi, opA
+    call parse_operand
+    mov rdi, opB
+    call parse_operand
+
+    cmp qword [opB], 2
+    je .imm_form
+
+    cmp qword [opA], 1
+    je .mem_dst
+    cmp qword [opB], 1
+    je .mem_src
+
+    ; reg, reg
+    mov r12, [opB + 8]
+    mov r15, opA
+    jmp encode_rm
+
+.mem_dst:                       ; mem, reg
+    mov r12, [opB + 8]
+    mov r15, opA
+    jmp encode_rm
+
+.mem_src:                       ; reg, mem  ->  opcode + 2
+    add rbp, 2
+    mov r12, [opA + 8]
+    mov r15, opB
+    jmp encode_rm
+
+.imm_form:
+    mov rdx, [opB + 16]
+    mov r10, rbp                ; keep the base opcode for the accumulator form
+    mov r12, [alu_digit]        ; the /digit goes in the reg field
+    mov rax, rdx
+    cmp rax, 127
+    jg .imm32
+    cmp rax, -128
+    jl .imm32
+    mov rbp, 0x83
+    mov r15, opA
+    push rdx
+    call encode_rm
+    pop rdx
+    mov rdi, rdx
+    call emit_byte
+    add qword [pc_vaddr], 1
+    ret
+
+.imm32:
+    ; "<op> rax, imm32" has a one-byte-shorter accumulator form with no ModRM
+    ; byte (opcode base + 4). binutils uses it, so match it.
+    cmp qword [opA], 0
+    jne .imm32_general
+    cmp qword [opA + 8], 0
+    jne .imm32_general
     mov rdi, 0x48
     call emit_byte
-    mov rdi, 0x89
+    mov rax, r10
+    add rax, 4
+    mov rdi, rax
     call emit_byte
-    mov rdi, r12
-    or rdi, 0xC0
-    mov rax, r15
-    shl rax, 3
-    or rdi, rax
-    call emit_byte
-.size_reg:
-    add qword [pc_vaddr], 3
+    add qword [pc_vaddr], 2
+    mov rdi, rdx
+    call emit_dword
+    add qword [pc_vaddr], 4
     ret
+
+.imm32_general:
+    mov rbp, 0x81
+    mov r15, opA
+    push rdx
+    call encode_rm
+    pop rdx
+    mov rdi, rdx
+    call emit_dword
+    add qword [pc_vaddr], 4
+    ret
+
+; ------------------------------------------------------------------------------
+; mov
+;   reg, imm32   REX.W C7 /0 id
+;   reg, reg     REX.W 89 /r
+;   mem, reg     REX.W 89 /r
+;   reg, mem     REX.W 8B /r
+; ------------------------------------------------------------------------------
+parse_mov:
+    mov rdi, opA
+    call parse_operand
+    mov rdi, opB
+    call parse_operand
+
+    cmp qword [opB], 2
+    je .imm_form
+    cmp qword [opB], 1
+    je .from_mem
+
+    ; reg/mem <- reg
+    mov rbp, 0x89
+    mov r12, [opB + 8]
+    mov r15, opA
+    jmp encode_rm
+
+.from_mem:
+    mov rbp, 0x8B
+    mov r12, [opA + 8]
+    mov r15, opB
+    jmp encode_rm
+
+.imm_form:
+    mov rbp, 0xC7
+    xor r12, r12                ; /0
+    mov r15, opA
+    call encode_rm
+    mov rdi, [opB + 16]
+    call emit_dword
+    add qword [pc_vaddr], 4
+    ret
+
+; ------------------------------------------------------------------------------
+; shl / shr / sar
+;   reg, imm8    REX.W C1 /d ib
+;   reg, cl      REX.W D3 /d
+; ------------------------------------------------------------------------------
+parse_shift:
+    movzx rax, byte [rsi + 5]   ; /digit: 4 = shl, 5 = shr, 7 = sar
+    mov [alu_digit], rax
+    mov rdi, opA
+    call parse_operand
+
+    ; second operand: "cl" or an immediate
+    call get_token
+    cmp rcx, 2
+    jne .imm
+    mov ax, word [rdi]
+    cmp ax, 'cl'
+    jne .imm
+
+    mov rbp, 0xD3
+    mov r12, [alu_digit]
+    mov r15, opA
+    jmp encode_rm
+
+.imm:
+    call is_number
+    cmp rdx, 1
+    jne error_exit
+    mov rbx, rax
+    ; shift-by-one has its own one-byte-shorter opcode, and binutils uses it,
+    ; so match it or the golden byte comparison fails on a non-bug.
+    cmp rbx, 1
+    je .by_one
+    mov rbp, 0xC1
+    mov r12, [alu_digit]
+    mov r15, opA
+    push rbx
+    call encode_rm
+    pop rbx
+    mov rdi, rbx
+    call emit_byte
+    add qword [pc_vaddr], 1
+    ret
+.by_one:
+    mov rbp, 0xD1
+    mov r12, [alu_digit]
+    mov r15, opA
+    jmp encode_rm
 
 ; jmp rel32  ->  E9 cd  (5 bytes)
 parse_jmp:
@@ -814,6 +1241,8 @@ get_token:
     ret
 
 is_register:
+    cmp rcx, 2
+    je .two
     cmp rcx, 3
     jne .no_reg
     mov eax, [rdi]
@@ -834,6 +1263,27 @@ is_register:
     je .r6
     cmp eax, 'rdi'
     je .r7
+    cmp eax, 'r10'
+    je .r10
+    cmp eax, 'r11'
+    je .r11
+    cmp eax, 'r12'
+    je .r12
+    cmp eax, 'r13'
+    je .r13
+    cmp eax, 'r14'
+    je .r14
+    cmp eax, 'r15'
+    je .r15
+    jmp .no_reg
+.two:
+    ; r8 and r9. The extended registers need REX.B when used as r/m and REX.R
+    ; when used as the reg field; encode_rm derives both from the index.
+    mov ax, word [rdi]
+    cmp ax, 'r8'
+    je .r8
+    cmp ax, 'r9'
+    je .r9
 .no_reg:
     mov rax, -1
     ret
@@ -855,6 +1305,22 @@ is_register:
 .r6: mov eax, 6
     ret
 .r7: mov eax, 7
+    ret
+.r8: mov eax, 8
+    ret
+.r9: mov eax, 9
+    ret
+.r10: mov eax, 10
+    ret
+.r11: mov eax, 11
+    ret
+.r12: mov eax, 12
+    ret
+.r13: mov eax, 13
+    ret
+.r14: mov eax, 14
+    ret
+.r15: mov eax, 15
     ret
 
 is_number:
@@ -965,17 +1431,32 @@ emit_dword:
 ; ==============================================================================
 align 8
 opcode_table:
-    db "mov ", 1, 0x89, 0xB8, 0
+    ; name, type, opcode, ModRM /digit for the imm form, spare
+    db "mov ", 1, 0x89, 0, 0
     db "add ", 0, 0x01, 0, 0
-    db "sub ", 0, 0x29, 0, 0
-    db "cmp ", 0, 0x39, 0, 0
-    db "xor ", 0, 0x31, 0, 0
-    db "and ", 0, 0x21, 0, 0
+    db "or  ", 0, 0x09, 1, 0
+    db "and ", 0, 0x21, 4, 0
+    db "sub ", 0, 0x29, 5, 0
+    db "xor ", 0, 0x31, 6, 0
+    db "cmp ", 0, 0x39, 7, 0
+    db "shl ", 8, 4, 0, 0
+    db "shr ", 8, 5, 0, 0
+    db "sar ", 8, 7, 0, 0
     db "jmp ", 2, 0xE9, 0, 0
     db "je  ", 3, 0x84, 0, 0
     db "jne ", 3, 0x85, 0, 0
     db "jl  ", 3, 0x8C, 0, 0
     db "jg  ", 3, 0x8F, 0, 0
+    db "jz  ", 3, 0x84, 0, 0   ; alias of je
+    db "jnz ", 3, 0x85, 0, 0   ; alias of jne
+    db "jle ", 3, 0x8E, 0, 0
+    db "jge ", 3, 0x8D, 0, 0
+    db "jb  ", 3, 0x82, 0, 0
+    db "jae ", 3, 0x83, 0, 0
+    db "jbe ", 3, 0x86, 0, 0
+    db "ja  ", 3, 0x87, 0, 0
+    db "js  ", 3, 0x88, 0, 0
+    db "jns ", 3, 0x89, 0, 0
     db "call", 4, 0xE8, 0, 0
     db "ret ", 5, 0xC3, 0, 0
     db "sysc", 6, 0x0F, 0x05, 0
