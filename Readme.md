@@ -1,6 +1,6 @@
 This single-file program reads its own source code (`mini_asm.asm`), parses the instructions and labels, calculates x86-64 machine code, generates a valid ELF64 executable header, and writes the final binary (`a.out`).
 
-[simpleC++ compiler](https://github.com/netpipe/simpleC-/tree/main) is designed to make assembly for this using --minimal flag
+[simpleC++ compiler](https://github.com/netpipe/simpleC-/tree/main) is designed to make assembly for this using --minimal --NASM parameters for generating the code
 
 ### Bootstrapping Instructions
 1.  **Compile with NASM:** `nasm -f elf64 mini_asm.asm -o mini_asm.o`
