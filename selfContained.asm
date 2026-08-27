@@ -67,6 +67,7 @@ alu_digit resq 1 ; ModRM /digit for the immediate and shift forms
 reg_size resq 1  ; size of the register is_register last recognised
 rex_w resq 1     ; 1 = emit REX.W, 0 = 8-bit operand, REX only if needed
 data_size resq 1 ; element width for dw/dd/dq: 2, 4 or 8 (0 selects db)
+imm_tmp resq 1   ; the immediate being encoded, parked across emit_* calls
 
 section .text
 
@@ -1095,11 +1096,48 @@ parse_mov:
     jmp encode_rm
 
 .imm_form:
+    ; C7 /0 id carries a 32-bit field that the processor SIGN-EXTENDS to 64.
+    ; An immediate outside -2^31..2^31-1 therefore cannot use it -- the value
+    ; loaded would silently be a different number. GNU as switches to the
+    ; 10-byte REX.W B8+rd io form for those, and keeps the 7-byte form when it
+    ; fits, so both halves of that rule have to be matched here or the golden
+    ; byte comparison fails.
+    mov rax, [opB + 16]
+    mov [imm_tmp], rax
+    shl rax, 32
+    sar rax, 32                 ; round-trip it through a 32-bit field
+    cmp rax, [imm_tmp]
+    je .imm32                   ; survived: the short form is exact
+
+    ; only the register form has a full 64-bit immediate; there is no
+    ; `mov [mem], imm64` on x86-64
+    cmp qword [opA], 0
+    jne error_exit
+
+    mov rax, 0x48               ; REX.W
+    mov rcx, [opA + 8]
+    cmp rcx, 8
+    jl .movabs_rex
+    add rax, 1                  ; REX.B for r8..r15
+.movabs_rex:
+    mov rdi, rax
+    call emit_byte
+    mov rax, [opA + 8]
+    and rax, 7
+    add rax, 0xB8               ; B8+rd
+    mov rdi, rax
+    call emit_byte
+    mov rdi, [imm_tmp]
+    call emit_qword
+    add qword [pc_vaddr], 10
+    ret
+
+.imm32:
     mov rbp, 0xC7
     xor r12, r12                ; /0
     mov r15, opA
     call encode_rm
-    mov rdi, [opB + 16]
+    mov rdi, [imm_tmp]
     call emit_dword
     add qword [pc_vaddr], 4
     ret
@@ -1651,6 +1689,19 @@ emit_dword:
     mov dword [out_buf + rbx], edi
     add qword [out_ptr], 4
 .skip:
+    ret
+
+; ------------------------------------------------------------------------------
+; emit_qword: rdi = 64-bit value, little-endian, as two dwords.
+; The value goes through a bss slot rather than a register because emit_dword
+; is a helper and is free to clobber rbx (see the register contract at the top).
+; ------------------------------------------------------------------------------
+emit_qword:
+    mov [imm_tmp], rdi
+    call emit_dword
+    mov rdi, [imm_tmp]
+    shr rdi, 32
+    call emit_dword
     ret
 
 ; ==============================================================================
