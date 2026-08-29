@@ -20,7 +20,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 FAIL=0
 
 # name:expected exit code
-CASES="golden1:42 golden2:55 golden3:42 golden4:0 subset:42 golden5:42"
+CASES="golden1:42 golden2:55 golden3:42 golden4:0 subset:42 golden5:42 golden6:42"
 
 for c in $CASES; do
     name=${c%%:*}
@@ -81,6 +81,42 @@ PY
     rm -rf "$work"
 done
 
+# ---------------------------------------------------------------------------
+# Reservations. Not byte-compared, and the reason is worth being explicit
+# about: `ld` chooses where .bss goes and mini-asm puts it at a fixed address
+# of its own, so the immediates differ for a reason that has nothing to do
+# with encoding. What is checked instead is that the labels are defined, the
+# memory is zero, writable and distinct, and that NOTHING WAS EMITTED for any
+# of it -- the file has to stay small while p_memsz grows past it.
+# ---------------------------------------------------------------------------
+work=$(mktemp -d)
+cp "$ASM" "$work/mini_asm"
+cp "$ROOT/tests/bss.asm" "$work/selfHosted.asm"
+( cd "$work" && rm -f a.out && timeout 10 ./mini_asm ) 2>"$work/err"
+if [ ! -f "$work/a.out" ]; then
+    echo "FAIL bss: assembler rejected it: $(cat "$work/err")"
+    FAIL=1
+else
+    chmod +x "$work/a.out"
+    "$work/a.out"
+    rc=$?
+    size=$(wc -c < "$work/a.out")
+    memsz=$(readelf -lW "$work/a.out" 2>/dev/null | awk '/LOAD/{print strtonum($6)}')
+    if [ "$rc" -ne 42 ]; then
+        echo "FAIL bss: program exited $rc, wanted 42"
+        FAIL=1
+    elif [ "$size" -gt 2048 ]; then
+        echo "FAIL bss: $size bytes on disk -- the reservations were emitted"
+        FAIL=1
+    elif [ "${memsz:-0}" -le "$size" ]; then
+        echo "FAIL bss: p_memsz $memsz does not reach past p_filesz $size"
+        FAIL=1
+    else
+        echo "PASS bss: $size bytes on disk, $memsz bytes of memory, exits 42"
+    fi
+fi
+rm -rf "$work"
+
 # The original assembler's failures, now expected to succeed.
 work=$(mktemp -d)
 cp "$ASM" "$work/mini_asm"
@@ -113,6 +149,31 @@ else
     echo "FAIL regression: unknown mnemonic was silently swallowed"
     FAIL=1
 fi
+
+# an error has to say WHICH LINE. "Error: " on its own is a fine report for a
+# nine-line program and useless for a 39,000-line one.
+printf '_start:\nmov rax, 60\nsqrtps xmm0, xmm1\nret\n' > "$work/selfHosted.asm"
+( cd "$work" && timeout 10 ./mini_asm ) 2>"$work/e"
+if grep -q "sqrtps" "$work/e"; then
+    echo "PASS regression: the error names the offending line"
+else
+    echo "FAIL regression: the error does not say which line"
+    FAIL=1
+fi
+
+# 8-bit register with an immediate is outside the subset. It used to assemble
+# to something else without saying so: `mov al, 9` came out as `mov al, al`,
+# and `cmp al, 9` as a 64-bit `cmp rax, 9`.
+for prog in 'mov al, 9' 'cmp al, 9'; do
+    printf '_start:\n    %s\n    ret\n' "$prog" > "$work/selfHosted.asm"
+    ( cd "$work" && timeout 10 ./mini_asm ) 2>"$work/e"
+    if grep -q "8-bit" "$work/e"; then
+        echo "PASS regression: '$prog' is refused, not mis-encoded"
+    else
+        echo "FAIL regression: '$prog' did not report the unsupported form"
+        FAIL=1
+    fi
+done
 rm -rf "$work"
 
 exit $FAIL

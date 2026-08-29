@@ -42,11 +42,17 @@ sym_msg db "Error: symbol table full", 10
 sym_msg_len equ 25
 big_msg db "Error: input larger than the buffer", 10
 big_len equ 36
+code_msg db "Error: code ran into the .bss base address", 10
+code_len equ 43
+bss_msg db "Error: .bss reservation is implausibly large", 10
+bss_len equ 44
+b8_msg db "Error: 8-bit register with an immediate is not supported", 10
+b8_len equ 57
 
 section .bss
 in_buf resb 1048576 ; 1MB input buffer
 out_buf resb 1048576 ; 1MB output buffer
-sym_tbl resb 65536 ; symbol table
+sym_tbl resb 262144 ; symbol table
 in_fd resq 1
 out_fd resq 1
 in_size resq 1
@@ -68,6 +74,8 @@ reg_size resq 1  ; size of the register is_register last recognised
 rex_w resq 1     ; 1 = emit REX.W, 0 = 8-bit operand, REX only if needed
 data_size resq 1 ; element width for dw/dd/dq: 2, 4 or 8 (0 selects db)
 imm_tmp resq 1   ; the immediate being encoded, parked across emit_* calls
+bss_size resq 1  ; bytes reserved by resb/resw/resd/resq so far
+sym_addr resq 1  ; the address add_symbol is about to record
 
 section .text
 
@@ -75,9 +83,33 @@ section .text
 base_vaddr equ 0x400000
 hdr_size equ 120
 code_vaddr equ base_vaddr + hdr_size
-sym_max equ 2730 ; sym_tbl is 65536 bytes at 24 bytes per entry. The original
+
+; Where resb/resq reservations live. A FIXED address, deliberately, and not
+; "wherever the code happens to end".
+;
+; The assembler is two-pass, and pass 2 must emit exactly the byte counts pass 1
+; measured. Instruction length here depends on the VALUE of an operand -- an
+; immediate that fits in 32 bits is `mov reg, imm32`, one that does not is the
+; 10-byte movabs form. If a .bss label were placed after the code, its value
+; would not be known until pass 1 had finished, so pass 1 would size it as one
+; instruction and pass 2 as another, and every label after that point would be
+; wrong. A fixed base is known before pass 1 starts, so both passes agree.
+;
+; Everything between p_filesz and p_memsz is zero-filled by the kernel, so the
+; gap between the end of the code and here costs address space and nothing at
+; all in the file or in resident memory.
+bss_vaddr equ base_vaddr + 0x400000
+bss_max equ 0x40000000        ; a reservation larger than 1 GiB is a typo
+sym_max equ 10922 ; sym_tbl is 262144 bytes at 24 bytes per entry. The original
                  ; reserved 4096 bytes and claimed 256 entries, which would have
                  ; run 2 KB past the end of the table.
+                 ;
+                 ; 65536 bytes (2730 entries) was enough for every hand-written
+                 ; program here and not for a real one: nano_cc's own source
+                 ; comes out as 4024 labels, so the first thing this assembler
+                 ; was pointed at that it had not been sized for hit the limit.
+                 ; It said so rather than overrunning, which is the only reason
+                 ; that was a five-minute problem.
 buf_size equ 1048576
 
 ; --- ELF64 HEADER (120 Bytes) ---
@@ -142,20 +174,42 @@ _start:
     mov qword [sym_cnt], 0
     mov qword [pc_vaddr], code_vaddr
     mov qword [out_ptr], hdr_size
+    mov qword [bss_size], 0
     xor r11, r11 ; r11 = 0 (Pass 1 mode)
     call process_file
 
     ; 5. Pass 2: Generate Machine Code
     mov qword [pc_vaddr], code_vaddr
     mov qword [out_ptr], hdr_size
+    mov qword [bss_size], 0
     mov r11, 1 ; r11 = 1 (Pass 2 mode)
     call process_file
 
-    ; 6. Patch ELF Header (p_filesz and p_memsz)
+    ; 6. Check the code did not run into the .bss base, then patch the header.
+    ;
+    ; The two are the same check: if the emitted code reached bss_vaddr, a
+    ; reservation and an instruction are sharing an address, and the program
+    ; would overwrite its own code the first time it touched that global.
+    mov rax, [pc_vaddr]
+    cmp rax, bss_vaddr
+    jae code_too_big
+
+    ; p_filesz is what is in the file. p_memsz reaches past the end of the file
+    ; to cover the reservations, and the kernel zero-fills the difference --
+    ; which is the whole point: 19 MB of uninitialised globals cost nothing.
+    ;
+    ; With nothing reserved, p_memsz stays equal to p_filesz exactly as before,
+    ; so every program that does not use .bss produces the same bytes it did.
     mov rax, [out_ptr]
     mov rdi, out_buf
     mov [rdi+96], rax ; p_filesz offset in phdr
     mov [rdi+104], rax ; p_memsz offset in phdr
+    cmp qword [bss_size], 0
+    je .no_bss
+    mov rax, bss_vaddr - base_vaddr
+    add rax, [bss_size]
+    mov [rdi+104], rax
+.no_bss:
 
     ; 7. Write Output File
     mov rax, 2 ; sys_open
@@ -188,6 +242,55 @@ error_exit:
     mov rsi, err_msg
     mov rdx, err_len
     syscall
+
+    call print_source_line
+    mov rax, 60
+    mov rdi, 1
+    syscall
+
+
+code_too_big:
+    mov rax, 1
+    mov rdi, 2
+    mov rsi, code_msg
+    mov rdx, code_len
+    syscall
+    mov rax, 60
+    mov rdi, 1
+    syscall
+
+bss_too_big:
+    mov rax, 1
+    mov rdi, 2
+    mov rsi, bss_msg
+    mov rdx, bss_len
+    syscall
+    mov rax, 60
+    mov rdi, 1
+    syscall
+
+; `mov al, 9` and `cmp al, 9` are outside the documented subset, and until now
+; they did not say so -- they assembled to something else and said nothing.
+;
+;   mov al, 9   ->  88 c0   which is `mov al, al`. parse_mov checks for a
+;                   byte-sized operand BEFORE it checks for an immediate, so
+;                   it read the immediate slot as a register index and found 0.
+;   cmp al, 9   ->  48 83 f8 09   which is `cmp rax, 9`. parse_alu checks for
+;                   the immediate first and never looks at the operand size, so
+;                   it compared all 64 bits of rax when only al was written.
+;
+; The second is the worse one: it is a correct instruction for the wrong
+; register, and after `mov al, [rsi]` the upper 56 bits of rax are whatever they
+; were, so it compares a byte against nine and then fails on a value nobody
+; wrote. Refusing is not the whole answer -- encoding b0+r and 3c would be --
+; but an error is strictly better than plausible wrong bytes, and it makes the
+; documented subset something the assembler actually enforces.
+byte_imm_unsupported:
+    mov rax, 1
+    mov rdi, 2
+    mov rsi, b8_msg
+    mov rdx, b8_len
+    syscall
     mov rax, 60
     mov rdi, 1
     syscall
@@ -205,6 +308,61 @@ input_too_big:
 ; A word that is neither a known instruction nor a known directive. Reported
 ; rather than skipped: silently dropping a line the assembler does not
 ; understand produces a binary that is quietly missing instructions.
+; print_source_line — write the source line r13 is pointing into, to stderr.
+;
+; "Error: " with nothing after it was by a wide margin the most expensive thing
+; about working with this assembler. It is a fine report for a nine-line test
+; program and useless for a real one: the first real input pointed at it was
+; 39,000 lines, and nothing in the message said which of them it objected to.
+;
+; r13 is the read pointer, so walk back to the newline before it and forward to
+; the one after, and print what lies between.
+print_source_line:
+    lea r8, [in_buf]
+    mov r9, [in_size]
+    add r9, r8
+    cmp r13, r8
+    jb .none                    ; r13 is not in the buffer: the open failed,
+    cmp r13, r9                 ; and there is no line to point at
+    ja .none
+    mov rsi, r13
+.back:
+    cmp rsi, r8
+    jbe .fwd_init
+    mov rdi, rsi
+    sub rdi, 1
+    movzx rax, byte [rdi]
+    cmp al, 10
+    je .fwd_init
+    mov rsi, rdi
+    jmp .back
+.fwd_init:
+    xor rcx, rcx
+.fwd:
+    cmp rcx, 200                ; one line, not the rest of the file
+    jge .print
+    movzx rax, byte [rsi + rcx]
+    cmp al, 0
+    je .print
+    cmp al, 10
+    je .print
+    inc rcx
+    jmp .fwd
+.print:
+    cmp rcx, 0
+    je .none
+    mov rdx, rcx
+    mov rax, 1
+    mov rdi, 2
+    syscall                     ; rsi is already the start of the line
+    mov rax, 1
+    mov rdi, 2
+    mov rsi, nl_msg
+    mov rdx, 1
+    syscall
+.none:
+    ret
+
 unknown_mnemonic:
     mov rax, 1
     mov rdi, 2
@@ -221,6 +379,7 @@ unknown_mnemonic:
     mov rsi, nl_msg
     mov rdx, 1
     syscall
+    call print_source_line
     mov rax, 60
     mov rdi, 1
     syscall
@@ -341,7 +500,34 @@ process_label:
 ; Only defined during pass 1; pass 2 would otherwise append a second copy of
 ; every symbol and overflow the table.
 ; ------------------------------------------------------------------------------
+; label_name_len — length of the name at rdi, up to whitespace or end of line.
+; Returns it in rcx, which is what add_symbol and hash_str_token expect.
+; Shared by "name db ..." and "name resb ..." rather than written twice: two
+; copies of a name scanner is two places for the terminator set to drift.
+label_name_len:
+    xor rcx, rcx
+.scan:
+    movzx rax, byte [rdi + rcx]
+    cmp al, ' '
+    je .done
+    cmp al, 9
+    je .done
+    cmp al, 0
+    je .done
+    cmp al, 10
+    je .done
+    inc rcx
+    jmp .scan
+.done:
+    ret
+
+; add_symbol      — define the name at rdi/rcx at the current code address.
+; add_symbol_abs  — define it at the address in rax instead, for .bss labels,
+;                   which are nowhere near the program counter.
 add_symbol:
+    mov rax, [pc_vaddr]
+add_symbol_abs:
+    mov [sym_addr], rax         ; parked: hash_str_token returns in rax
     test r11, r11
     jnz .done                   ; pass 2: symbols are already known
     mov rbx, [sym_cnt]
@@ -358,7 +544,7 @@ add_symbol:
     pop rax
     mov [rdi], rax
     mov [rdi+8], r9
-    mov rax, [pc_vaddr]
+    mov rax, [sym_addr]
     mov [rdi+16], rax
     inc qword [sym_cnt]
 .done:
@@ -398,14 +584,51 @@ hash_str_token:
 ; Only rax/rcx/rdi are touched. r13 is deliberately NOT used, so callers can look
 ; ahead at a second word without disturbing the read pointer.
 ; ------------------------------------------------------------------------------
+; ident_char — is al part of an identifier?  in: al   out: rdx = 1 if yes.
+;
+; a-z was the whole test until nano_cc's output arrived. That output is full of
+; names like `_n`, `cont_lbl` and `asm_sym.buf`, and word_key stopped at the
+; first character outside a-z -- so `_n resb 8` produced a key of four spaces,
+; which then matched the '    ' terminator of whichever table was searched next
+; and the line was silently treated as a directive to ignore. The label was
+; never defined, and the first use of it failed with no indication that a
+; DEFINITION had gone missing rather than a reference being wrong.
+ident_char:
+    mov rdx, 1
+    cmp al, 'a'
+    jb .upper
+    cmp al, 'z'
+    jbe .yes
+.upper:
+    cmp al, 'A'
+    jb .digit
+    cmp al, 'Z'
+    jbe .yes
+.digit:
+    cmp al, '0'
+    jb .punct
+    cmp al, '9'
+    jbe .yes
+.punct:
+    cmp al, '_'
+    je .yes
+    cmp al, '.'
+    je .yes
+    cmp al, '$'
+    je .yes
+    xor rdx, rdx
+.yes:
+    ret
+
+; word_key — the first four identifier characters at rdi, space-padded, as one
+; 32-bit key. Advances rdi past the WHOLE word, however long it is.
 word_key:
     xor rcx, rcx
 .copy:
     movzx rax, byte [rdi]
-    cmp al, 'a'
-    jb .fill
-    cmp al, 'z'
-    ja .fill
+    call ident_char
+    cmp rdx, 0
+    je .fill
     cmp rcx, 4
     jge .skip_rest
     mov byte [key_buf + rcx], al
@@ -415,10 +638,9 @@ word_key:
 .skip_rest:
     inc rdi
     movzx rax, byte [rdi]
-    cmp al, 'a'
-    jb .fill
-    cmp al, 'z'
-    ja .fill
+    call ident_char
+    cmp rdx, 0
+    je .fill
     jmp .skip_rest
 .fill:
     cmp rcx, 4
@@ -437,10 +659,10 @@ word_key:
 is_directive:
     lea r8, [directive_table]
 .loop:
+    cmp dword [r8], '    '      ; terminator first -- see parse_instruction
+    je .no
     cmp dword [r8], eax
     je .yes
-    cmp dword [r8], '    '
-    je .no
     add r8, 4
     jmp .loop
 .yes:
@@ -462,10 +684,15 @@ parse_instruction:
 
     lea rsi, [opcode_table]
 .find_loop:
-    cmp dword [rsi], eax
-    je .found
+    ; The terminator is tested FIRST. Both tables end with a '    ' entry, and
+    ; a key of four spaces is a real possibility -- word_key produces one for a
+    ; word made entirely of characters it does not accept. Matching the
+    ; terminator as though it were an opcode sent the assembler into a table
+    ; entry that is not one.
     cmp dword [rsi], '    '
     je .not_found
+    cmp dword [rsi], eax
+    je .found
     add rsi, 8
     jmp .find_loop
 
@@ -536,6 +763,18 @@ parse_instruction:
     mov qword [data_size], 8
     cmp eax, 'dq  '
     je .data_label
+    mov qword [data_size], 1
+    cmp eax, 'resb'
+    je .reserve
+    mov qword [data_size], 2
+    cmp eax, 'resw'
+    je .reserve
+    mov qword [data_size], 4
+    cmp eax, 'resd'
+    je .reserve
+    mov qword [data_size], 8
+    cmp eax, 'resq'
+    je .reserve
     call is_directive
     cmp rdx, 1
     je .skip
@@ -545,23 +784,40 @@ parse_instruction:
 .skip:
     ret
 
+.reserve:
+    ; "name resb N" — reserve N * width bytes of zeroed memory and define name
+    ; at the address they will have. Nothing is emitted: that is the entire
+    ; point, and it is why the same source came out at 61 MB when uninitialised
+    ; globals were written as `db 0, 0, 0, ...` instead.
+    ;
+    ; Before this, the line fell through to is_directive and was skipped whole,
+    ; so the LABEL WAS NEVER DEFINED -- and a program with a .bss died on the
+    ; first reference to a global with an empty "Error:" and nothing else.
+    mov rdi, r13
+    call label_name_len
+    mov rax, bss_vaddr
+    add rax, [bss_size]
+    call add_symbol_abs
+
+    mov r13, r12                ; consume "name resb"
+    call get_token
+    cmp rcx, 0
+    je error_exit               ; a reservation with no count
+    call is_number
+    cmp rdx, 1
+    jne error_exit              ; ... or one that is not a number
+    mov rcx, [data_size]
+    mul rcx                     ; rax = count * element width
+    add rax, [bss_size]
+    cmp rax, bss_max
+    jae bss_too_big             ; also catches a count that wrapped
+    mov [bss_size], rax
+    ret
+
 .data_label:
     ; "name db ..." — define name at the current address, then emit the bytes.
     mov rdi, r13
-    xor rcx, rcx
-.name_len:
-    movzx rax, byte [rdi + rcx]
-    cmp al, ' '
-    je .got_name
-    cmp al, 9
-    je .got_name
-    cmp al, 0
-    je .got_name
-    cmp al, 10
-    je .got_name
-    inc rcx
-    jmp .name_len
-.got_name:
+    call label_name_len
     call add_symbol
     mov r13, r12                ; consume "name db" / "name dq" / ...
     cmp qword [data_size], 0
@@ -967,6 +1223,13 @@ parse_alu:
     mov rdi, opB
     call parse_operand
 
+    ; Before anything else: this instruction group has no 8-bit forms here, and
+    ; the immediate path below would silently widen a byte compare to 64 bits.
+    cmp qword [opA + 32], 1
+    je byte_imm_unsupported
+    cmp qword [opB + 32], 1
+    je byte_imm_unsupported
+
     cmp qword [opB], 2
     je .imm_form
 
@@ -1081,6 +1344,8 @@ parse_mov:
 
 .byte_form:
     mov qword [rex_w], 0
+    cmp qword [opB], 2
+    je byte_imm_unsupported     ; mov al, 9 -- see the note by the label
     cmp qword [opB], 1
     je .byte_from_mem
     ; r/m8 <- reg8
@@ -1756,10 +2021,17 @@ directive_table:
     db "bits"
     db "org "
     db "equ "
-    db "resb"
-    db "resw"
-    db "resd"
-    db "resq"
+    ; resb / resw / resd / resq are NO LONGER ignored either, for the same
+    ; reason dw/dd/dq stopped being: "ignore it" and "handle it" look identical
+    ; until something depends on the difference. They are handled in
+    ; parse_instruction's .second path, as the SECOND word of "name resb N".
+    ;
+    ; A reservation that reaches here is therefore one with no name in front of
+    ; it -- including `name: resb N`, where the colon makes the name a code
+    ; label at the current address and leaves a bare `resb` behind. That form
+    ; cannot be assembled correctly, so it is reported rather than skipped: the
+    ; label would otherwise point into the middle of the code and every write
+    ; through it would overwrite an instruction.
     ; dw / dd / dq are NO LONGER ignored -- they are real data directives now,
     ; handled by parse_data. Leaving them here made `pp: dq msg` emit nothing
     ; and skip pc_vaddr, so pp silently aliased whatever label came next.
