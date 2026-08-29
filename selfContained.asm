@@ -31,8 +31,9 @@
 global _start
 
 section .data
-in_path db "selfHosted.asm", 0
-out_path db "a.out", 0
+; The defaults, for the no-argument invocation every test here uses.
+def_in_path db "selfHosted.asm", 0
+def_out_path db "a.out", 0
 err_msg db "Error: ", 10
 err_len equ 8
 unk_msg db "Error: unknown mnemonic: "
@@ -48,6 +49,10 @@ bss_msg db "Error: .bss reservation is implausibly large", 10
 bss_len equ 44
 b8_msg db "Error: 8-bit register with an immediate is not supported", 10
 b8_len equ 57
+args_msg db "Error: usage: mini_asm [input.asm [output]] [-b BASE]", 10
+args_len equ 54
+pass_msg db "Error: the two passes disagree about the size of the output", 10
+pass_len equ 59
 
 section .bss
 in_buf resb 1048576 ; 1MB input buffer
@@ -75,17 +80,51 @@ rex_w resq 1     ; 1 = emit REX.W, 0 = 8-bit operand, REX only if needed
 data_size resq 1 ; element width for dw/dd/dq: 2, 4 or 8 (0 selects db)
 imm_tmp resq 1   ; the immediate being encoded, parked across emit_* calls
 bss_size resq 1  ; bytes reserved by resb/resw/resd/resq so far
+data_split resq 1 ; file offset of `section .data`, or 0 if there was none
 sym_addr resq 1  ; the address add_symbol is about to record
+
+; Where the OUTPUT is linked. Runtime state now, not assemble-time constants:
+; the address a program is loaded at is a property of the machine it will run
+; on, and this assembler now has to produce binaries for two of them -- Linux
+; at 0x400000, and nano-os, whose user address space starts at 512 GiB.
+; Both passes read these, and they are set before pass 1 from the command line,
+; so the two passes never disagree about a value.
+out_base resq 1  ; -b, or 0x400000
+code_base resq 1 ; out_base + hdr_size -- the entry point
+bss_base resq 1  ; out_base + bss_gap
+in_path_p resq 1
+out_path_p resq 1
+
+; argv, and the scratch the argument parser and the OS block use.
+g_argc resq 1
+g_argv resq 1
+a_i resq 1
+a_pos resq 1
+a_cur resq 1
+t_path resq 1
+t_fd resq 1
+t_n resq 1
+t_buf resq 1
+t_res resq 1
+pass1_end resq 1 ; where pass 1 finished; pass 2 has to finish in the same place
 
 section .text
 
 ; --- CONSTANTS ---
-base_vaddr equ 0x400000
-hdr_size equ 120
-code_vaddr equ base_vaddr + hdr_size
+; 176 = one 64-byte ELF header and TWO 56-byte program headers.
+;
+; Two, because one segment has to be both writable and executable and that is
+; the single property every "write some bytes, then jump to them" technique
+; needs. A `section .data` in the source splits the image: everything before it
+; is read+execute, everything after is read+write, and nothing is both.
+;
+; A source with no `section .data` still gets one RWX segment, because its code
+; and its data are interleaved and there is nowhere to cut. e_phnum is patched
+; to 1 in that case rather than leaving a second header full of zeros.
+hdr_size equ 176
 
-; Where resb/resq reservations live. A FIXED address, deliberately, and not
-; "wherever the code happens to end".
+; Where resb/resq reservations live: a fixed distance above the output base,
+; deliberately, and not "wherever the code happens to end".
 ;
 ; The assembler is two-pass, and pass 2 must emit exactly the byte counts pass 1
 ; measured. Instruction length here depends on the VALUE of an operand -- an
@@ -98,7 +137,7 @@ code_vaddr equ base_vaddr + hdr_size
 ; Everything between p_filesz and p_memsz is zero-filled by the kernel, so the
 ; gap between the end of the code and here costs address space and nothing at
 ; all in the file or in resident memory.
-bss_vaddr equ base_vaddr + 0x400000
+bss_gap equ 0x400000
 bss_max equ 0x40000000        ; a reservation larger than 1 GiB is a typo
 sym_max equ 10922 ; sym_tbl is 262144 bytes at 24 bytes per entry. The original
                  ; reserved 4096 bytes and claimed 256 entries, which would have
@@ -118,156 +157,425 @@ db 0x7f, "ELF", 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0
 dw 2 ; e_type = ET_EXEC
 dw 0x3e ; e_machine = EM_X86_64
 dd 1 ; e_version
-dq code_vaddr ; e_entry
+dq 0 ; e_entry (PATCHED LATER -- depends on -b)
 dq 64 ; e_phoff
 dq 0 ; e_shoff
 dd 0 ; e_flags
 dw 64 ; e_ehsize
 dw 56 ; e_phentsize
-dw 1 ; e_phnum
+dw 2 ; e_phnum (PATCHED to 1 when there is no data section)
 dw 0 ; e_shentsize
 dw 0 ; e_shnum
 dw 0 ; e_shstrndx
 phdr:
 dd 1 ; p_type = PT_LOAD
-dd 7 ; p_flags = PF_R | PF_W | PF_X  (data lives in the same segment,
-     ; so without PF_W any write to a global faults)
+dd 7 ; p_flags (PATCHED: 5 = R|X when there are two segments, 7 if one)
 dq 0 ; p_offset
-dq base_vaddr ; p_vaddr
-dq base_vaddr ; p_paddr
+dq 0 ; p_vaddr (PATCHED LATER)
+dq 0 ; p_paddr (PATCHED LATER)
 dq 0 ; p_filesz (PATCHED LATER)
 dq 0 ; p_memsz (PATCHED LATER)
 dq 0x1000 ; p_align
 
+; The second segment: the data half. Left as PT_NULL and only filled in if a
+; `section .data` turned up, so an image with one segment does not carry a
+; header describing a region that does not exist.
+phdr2:
+dd 0 ; p_type = PT_NULL (PATCHED to PT_LOAD)
+dd 6 ; p_flags = PF_R | PF_W -- and deliberately not PF_X
+dq 0 ; p_offset (PATCHED LATER)
+dq 0 ; p_vaddr (PATCHED LATER)
+dq 0 ; p_paddr (PATCHED LATER)
+dq 0 ; p_filesz (PATCHED LATER)
+dq 0 ; p_memsz (PATCHED LATER)
+dq 0x1000 ; p_align
+
+; ==== TARGET BEGIN ====
+; ==============================================================================
+; TARGET: LINUX
+; ==============================================================================
+; Everything the assembler needs from the operating system it RUNS on lives in
+; this block, and nothing outside it issues a syscall or knows a syscall
+; number. `tools/retarget.py` swaps everything between the two TARGET markers
+; for another block -- fixed/target-nanoos.inc -- and produces the same
+; assembler, from the same body, running on nano-os instead.
+;
+; That is a split worth being deliberate about, because the alternative is two
+; copies of a 1,900-line assembler that drift apart -- and a divergence between
+; them would show up as a miscompilation on one platform and not the other,
+; which is close to the worst shape a bug can have.
+;
+; Note the OTHER axis, which is independent of this one: which OS the assembler
+; runs on has nothing to do with which base address it EMITS for. That is the
+; -b flag, and it is why building a nano-os assembler on Linux is possible at
+; all -- the Linux build, told -b 0x8000000000, produces the nano-os binary.
+;
+; The four routines and their contracts:
+;   os_read_input   rdi = path                  -> rax = bytes read into in_buf,
+;                                                  or negative if unreadable
+;   os_write_output rdi = path, rsi = buf,
+;                   rdx = length                -> rax = 0, or negative
+;   os_err          rsi = buf, rdx = length     -> writes to stderr
+;   os_exit         rdi = status                -> does not return
+;
+; and one constant, def_base: where output goes when -b is not given. That is a
+; property of the machine you would normally be assembling FOR, so it belongs
+; with the target rather than with the assembler.
+; ==============================================================================
+
+def_base equ 0x400000
+
 _start:
-    ; 1. Open Input File
-    mov rax, 2 ; sys_open
-    mov rdi, in_path
-    xor rsi, rsi ; O_RDONLY
+    ; Linux puts argc at [rsp] and argv immediately above it. This has to be
+    ; the very first thing that runs: a `call` would put a return address
+    ; exactly where argc is.
+    mov rax, [rsp]
+    mov [g_argc], rax
+    mov rax, rsp
+    add rax, 8
+    mov [g_argv], rax
+    jmp main_flow
+
+os_read_input:
+    mov [t_path], rdi
+    mov rax, 2                  ; sys_open
+    mov rdi, [t_path]
+    xor rsi, rsi                ; O_RDONLY
+    xor rdx, rdx
     syscall
     test rax, rax
-    js error_exit
-    mov [in_fd], rax
-
-    ; 2. Read Input File
-    mov rax, 0 ; sys_read
-    mov rdi, [in_fd]
-    mov rsi, in_buf
+    js .fail
+    mov [t_fd], rax
+    mov rax, 0                  ; sys_read
+    mov rdi, [t_fd]
+    lea rsi, [rip + in_buf]
     mov rdx, buf_size
     syscall
+    mov [t_n], rax
+    mov rax, 3                  ; sys_close
+    mov rdi, [t_fd]
+    syscall
+    mov rax, [t_n]
+    ret
+.fail:
+    mov rax, -1
+    ret
+
+os_write_output:
+    mov [t_path], rdi
+    mov [t_buf], rsi
+    mov [t_n], rdx
+    mov rax, 2                  ; sys_open
+    mov rdi, [t_path]
+    mov rsi, 577                ; O_WRONLY | O_CREAT | O_TRUNC
+    mov rdx, 420                ; 0644
+    syscall
+    test rax, rax
+    js .fail
+    mov [t_fd], rax
+    mov rax, 1                  ; sys_write
+    mov rdi, [t_fd]
+    mov rsi, [t_buf]
+    mov rdx, [t_n]
+    syscall
+    mov [t_n], rax
+    mov rax, 3                  ; sys_close
+    mov rdi, [t_fd]
+    syscall
+    xor rax, rax
+    ret
+.fail:
+    mov rax, -1
+    ret
+
+os_err:
+    mov rax, 1                  ; sys_write
+    mov rdi, 2                  ; stderr
+    syscall
+    ret
+
+os_exit:
+    mov rax, 60
+    syscall
+; ==== TARGET END ====
+
+; cstr_len — length of the NUL-terminated string at rdi, in rcx.
+; is_number wants a pointer and a length; argv gives a pointer and a NUL.
+cstr_len:
+    xor rcx, rcx
+.loop:
+    movzx rax, byte [rdi + rcx]
+    cmp al, 0
+    je .done
+    inc rcx
+    jmp .loop
+.done:
+    ret
+
+; parse_args — mini_asm [input.asm [output]] [-b BASE]
+;
+; With no arguments at all it behaves exactly as it always has: selfHosted.asm
+; in, a.out out, linked at 0x400000. Every existing test invokes it that way,
+; which is the point -- adding arguments must not change the no-argument case.
+;
+; Loop state lives in memory rather than registers because is_number clobbers
+; rax, rbx, rcx, rdx, rdi, r8 and r9, and the argument index was in one of them
+; the first time this was written.
+parse_args:
+    ; Through a register for the same reason as the base below: a store of an
+    ; immediate to memory carries 32 bits, and a symbol above 2 GiB does not
+    ; fit in them.
+    lea rax, [rip + def_in_path]
+    mov [in_path_p], rax
+    lea rax, [rip + def_out_path]
+    mov [out_path_p], rax
+    ; Through a register, not `mov qword [mem], def_base`. A store of an
+    ; immediate to memory carries 32 bits and sign-extends them; 0x400000 fits
+    ; and nano-os's 0x8000000000 does not, so writing it that way is correct on
+    ; one target and silently a different number on the other. GNU as refuses
+    ; it outright, which is the good outcome -- but only because it was asked.
+    mov rax, def_base
+    mov [out_base], rax
+    mov qword [a_i], 1
+    mov qword [a_pos], 0
+.loop:
+    mov rax, [a_i]
+    cmp rax, [g_argc]
+    jge .done
+    mov rbx, rax
+    shl rbx, 3
+    add rbx, [g_argv]
+    mov rdi, [rbx]
+    mov [a_cur], rdi
+    movzx rax, byte [rdi]
+    cmp al, '-'
+    jne .positional
+
+    ; -b BASE
+    movzx rax, byte [rdi + 1]
+    cmp al, 'b'
+    jne bad_args
+    movzx rax, byte [rdi + 2]
+    cmp al, 0
+    jne bad_args
+    mov rax, [a_i]
+    inc rax
+    mov [a_i], rax
+    cmp rax, [g_argc]
+    jge bad_args                ; -b with nothing after it
+    mov rbx, rax
+    shl rbx, 3
+    add rbx, [g_argv]
+    mov rdi, [rbx]
+    call cstr_len
+    call is_number
+    cmp rdx, 1
+    jne bad_args
+    mov [out_base], rax
+    jmp .next
+
+.positional:
+    mov rax, [a_pos]
+    cmp rax, 0
+    jne .second
+    mov rax, [a_cur]
+    mov [in_path_p], rax
+    mov qword [a_pos], 1
+    jmp .next
+.second:
+    cmp rax, 1
+    jne bad_args                ; a third file name is a mistake, not an input
+    mov rax, [a_cur]
+    mov [out_path_p], rax
+    mov qword [a_pos], 2
+
+.next:
+    mov rax, [a_i]
+    inc rax
+    mov [a_i], rax
+    jmp .loop
+
+.done:
+    ; Everything else is derived, once, before pass 1 -- so both passes see the
+    ; same addresses and size every instruction the same way.
+    mov rax, [out_base]
+    add rax, hdr_size
+    mov [code_base], rax
+    mov rax, [out_base]
+    add rax, bss_gap
+    mov [bss_base], rax
+    ret
+
+main_flow:
+    call parse_args
+
+    ; 1. Read the input
+    mov rdi, [in_path_p]
+    call os_read_input
+    test rax, rax
+    js error_exit
     mov [in_size], rax
-    ; A short buffer would silently assemble the first N bytes and drop the
-    ; rest, which is far worse than refusing.
+    ; A short read would silently assemble the first N bytes and drop the rest,
+    ; which is far worse than refusing.
     cmp rax, buf_size
     jge input_too_big
-    mov rax, 3 ; sys_close
-    mov rdi, [in_fd]
-    syscall
 
-    ; 3. Initialize Output Buffer with ELF Header
+    ; 2. Initialize Output Buffer with ELF Header
     lea rsi, [elf_hdr]
     lea rdi, [out_buf]
     mov rcx, hdr_size
     rep movsb
 
-    ; 4. Pass 1: Scan Labels & Calculate Sizes
+    ; 3. Pass 1: Scan Labels & Calculate Sizes
     mov qword [sym_cnt], 0
-    mov qword [pc_vaddr], code_vaddr
+    mov rax, [code_base]
+    mov [pc_vaddr], rax
     mov qword [out_ptr], hdr_size
     mov qword [bss_size], 0
+    mov qword [data_split], 0
     xor r11, r11 ; r11 = 0 (Pass 1 mode)
     call process_file
 
-    ; 5. Pass 2: Generate Machine Code
-    mov qword [pc_vaddr], code_vaddr
+    ; Remember where pass 1 finished. The two passes MUST agree, and until this
+    ; check existed they could disagree silently -- see the note at .imm. A
+    ; divergence does not produce a broken-looking binary, it produces a
+    ; plausible one whose labels are all wrong past the first instruction that
+    ; changed size.
+    mov rax, [pc_vaddr]
+    mov [pass1_end], rax
+
+    ; 4. Pass 2: Generate Machine Code
+    mov rax, [code_base]
+    mov [pc_vaddr], rax
     mov qword [out_ptr], hdr_size
     mov qword [bss_size], 0
+    mov qword [data_split], 0
     mov r11, 1 ; r11 = 1 (Pass 2 mode)
     call process_file
 
-    ; 6. Check the code did not run into the .bss base, then patch the header.
+    mov rax, [pc_vaddr]
+    cmp rax, [pass1_end]
+    jne pass_mismatch
+
+    ; 5. Check the code did not run into the .bss base, then patch the header.
     ;
-    ; The two are the same check: if the emitted code reached bss_vaddr, a
+    ; The two are the same check: if the emitted code reached the .bss base, a
     ; reservation and an instruction are sharing an address, and the program
     ; would overwrite its own code the first time it touched that global.
     mov rax, [pc_vaddr]
-    cmp rax, bss_vaddr
+    cmp rax, [bss_base]
     jae code_too_big
 
-    ; p_filesz is what is in the file. p_memsz reaches past the end of the file
-    ; to cover the reservations, and the kernel zero-fills the difference --
-    ; which is the whole point: 19 MB of uninitialised globals cost nothing.
+    lea rdi, [rip + out_buf]
+
+    ; The load address, which is only known now: it came from -b.
+    mov rax, [code_base]
+    mov [rdi+24], rax           ; e_entry
+    mov rax, [out_base]
+    mov [rdi+80], rax           ; p_vaddr
+    mov [rdi+88], rax           ; p_paddr
+
+    cmp qword [data_split], 0
+    jne .two_segments
+
+    ; ---- one segment ----
+    ; No `section .data`, so code and data are interleaved and there is nowhere
+    ; to cut. It stays RWX, and e_phnum drops to 1 rather than leaving a header
+    ; that describes a segment which does not exist. The image is byte for byte
+    ; what it always was.
     ;
-    ; With nothing reserved, p_memsz stays equal to p_filesz exactly as before,
-    ; so every program that does not use .bss produces the same bytes it did.
+    ; p_filesz is what is in the file. p_memsz reaches past the end of it to
+    ; cover the reservations, and the loader zero-fills the difference -- which
+    ; is the whole point: 19 MB of uninitialised globals cost nothing.
+    mov word [rdi+56], 1        ; e_phnum
     mov rax, [out_ptr]
-    mov rdi, out_buf
-    mov [rdi+96], rax ; p_filesz offset in phdr
-    mov [rdi+104], rax ; p_memsz offset in phdr
+    mov [rdi+96], rax           ; p_filesz
+    mov [rdi+104], rax          ; p_memsz
     cmp qword [bss_size], 0
-    je .no_bss
-    mov rax, bss_vaddr - base_vaddr
+    je .patched
+    mov rax, bss_gap
     add rax, [bss_size]
     mov [rdi+104], rax
-.no_bss:
+    jmp .patched
 
-    ; 7. Write Output File
-    mov rax, 2 ; sys_open
-    mov rdi, out_path
-    mov rsi, 577 ; O_WRONLY | O_CREAT | O_TRUNC
-    mov rdx, 420 ; 0644 octal
-    syscall
+.two_segments:
+    ; ---- two: read+execute up to the split, read+write after it ----
+    ; Nothing is both, which is the only property that matters here.
+    mov dword [rdi+68], 5       ; phdr1 p_flags = PF_R | PF_X
+    mov rax, [data_split]
+    mov [rdi+96], rax           ; phdr1 p_filesz = everything before the split
+    mov [rdi+104], rax          ; phdr1 p_memsz  = the same; code is all file
+
+    mov dword [rdi+120], 1      ; phdr2 p_type = PT_LOAD
+    mov rax, [data_split]
+    mov [rdi+128], rax          ; phdr2 p_offset
+    mov rbx, [out_base]
+    add rbx, rax
+    mov [rdi+136], rbx          ; phdr2 p_vaddr
+    mov [rdi+144], rbx          ; phdr2 p_paddr
+    mov rbx, [out_ptr]
+    sub rbx, rax
+    mov [rdi+152], rbx          ; phdr2 p_filesz = the rest of the file
+    mov [rdi+160], rbx          ; phdr2 p_memsz, unless something was reserved
+    cmp qword [bss_size], 0
+    je .patched
+    ; The .bss sits bss_gap above the base, so measured from the data segment's
+    ; own start it reaches (bss_gap - split) + bss_size. Everything between the
+    ; end of the file and there is zero-filled by the loader.
+    mov rbx, bss_gap
+    sub rbx, rax
+    add rbx, [bss_size]
+    mov [rdi+160], rbx
+.patched:
+
+    ; 6. Write the output
+    mov rdi, [out_path_p]
+    lea rsi, [rip + out_buf]
+    mov rdx, [out_ptr]
+    call os_write_output
     test rax, rax
     js error_exit
-    mov [out_fd], rax
 
-    mov rax, 1 ; sys_write
-    mov rdi, [out_fd]
-    mov rsi, out_buf
-    mov rdx, [out_ptr]
-    syscall
-
-    mov rax, 3 ; sys_close
-    mov rdi, [out_fd]
-    syscall
-
-    ; 8. Exit
-    mov rax, 60
+    ; 7. Exit
     xor rdi, rdi
-    syscall
+    call os_exit
+
+pass_mismatch:
+    lea rsi, [rip + pass_msg]
+    mov rdx, pass_len
+    call os_err
+    mov rdi, 1
+    call os_exit
+
+bad_args:
+    lea rsi, [rip + args_msg]
+    mov rdx, args_len
+    call os_err
+    mov rdi, 1
+    call os_exit
 
 error_exit:
-    mov rax, 1
-    mov rdi, 2 ; stderr
-    mov rsi, err_msg
+    lea rsi, [rip + err_msg]
     mov rdx, err_len
-    syscall
-
+    call os_err
     call print_source_line
-    mov rax, 60
     mov rdi, 1
-    syscall
+    call os_exit
 
 
 code_too_big:
-    mov rax, 1
-    mov rdi, 2
-    mov rsi, code_msg
+    lea rsi, [rip + code_msg]
     mov rdx, code_len
-    syscall
-    mov rax, 60
+    call os_err
     mov rdi, 1
-    syscall
+    call os_exit
 
 bss_too_big:
-    mov rax, 1
-    mov rdi, 2
-    mov rsi, bss_msg
+    lea rsi, [rip + bss_msg]
     mov rdx, bss_len
-    syscall
-    mov rax, 60
+    call os_err
     mov rdi, 1
-    syscall
+    call os_exit
 
 ; `mov al, 9` and `cmp al, 9` are outside the documented subset, and until now
 ; they did not say so -- they assembled to something else and said nothing.
@@ -286,24 +594,18 @@ bss_too_big:
 ; but an error is strictly better than plausible wrong bytes, and it makes the
 ; documented subset something the assembler actually enforces.
 byte_imm_unsupported:
-    mov rax, 1
-    mov rdi, 2
-    mov rsi, b8_msg
+    lea rsi, [rip + b8_msg]
     mov rdx, b8_len
-    syscall
-    mov rax, 60
+    call os_err
     mov rdi, 1
-    syscall
+    call os_exit
 
 input_too_big:
-    mov rax, 1
-    mov rdi, 2
-    mov rsi, big_msg
+    lea rsi, [rip + big_msg]
     mov rdx, big_len
-    syscall
-    mov rax, 60
+    call os_err
     mov rdi, 1
-    syscall
+    call os_exit
 
 ; A word that is neither a known instruction nor a known directive. Reported
 ; rather than skipped: silently dropping a line the assembler does not
@@ -352,37 +654,26 @@ print_source_line:
     cmp rcx, 0
     je .none
     mov rdx, rcx
-    mov rax, 1
-    mov rdi, 2
-    syscall                     ; rsi is already the start of the line
-    mov rax, 1
-    mov rdi, 2
-    mov rsi, nl_msg
+    call os_err                 ; rsi is already the start of the line
+    lea rsi, [rip + nl_msg]
     mov rdx, 1
-    syscall
+    call os_err
 .none:
     ret
 
 unknown_mnemonic:
-    mov rax, 1
-    mov rdi, 2
-    mov rsi, unk_msg
+    lea rsi, [rip + unk_msg]
     mov rdx, unk_len
-    syscall
-    mov rax, 1
-    mov rdi, 2
-    mov rsi, key_buf
+    call os_err
+    lea rsi, [rip + key_buf]
     mov rdx, 4
-    syscall
-    mov rax, 1
-    mov rdi, 2
-    mov rsi, nl_msg
+    call os_err
+    lea rsi, [rip + nl_msg]
     mov rdx, 1
-    syscall
+    call os_err
     call print_source_line
-    mov rax, 60
     mov rdi, 1
-    syscall
+    call os_exit
 
 ; ==============================================================================
 ; CORE LOGIC
@@ -500,6 +791,36 @@ process_label:
 ; Only defined during pass 1; pass 2 would otherwise append a second copy of
 ; every symbol and overflow the table.
 ; ------------------------------------------------------------------------------
+; Pad to the next page and record where the data half of the image starts.
+;
+; The padding has to happen in BOTH passes, or they disagree about every
+; address after it -- so the count comes from pc_vaddr, which is correct in
+; both, rather than from out_ptr, which only moves in the emit pass.
+;
+; A page boundary is not decoration either. The loader maps a segment at
+; p_vaddr with the file bytes from p_offset, and the two have to be congruent
+; modulo the page size. Splitting mid-page would put one page in two segments
+; with different permissions, and whichever was mapped second would win.
+start_data_section:
+    mov rax, [pc_vaddr]
+    neg rax
+    and rax, 4095
+    mov [t_res], rax            ; how many bytes of padding
+.pad:
+    cmp qword [t_res], 0
+    je .padded
+    xor rdi, rdi
+    call emit_byte              ; emits in pass 2 only
+    inc qword [pc_vaddr]        ; but the address advances in both
+    dec qword [t_res]
+    jmp .pad
+.padded:
+    mov rax, [pc_vaddr]
+    sub rax, [code_base]
+    add rax, hdr_size           ; a file offset, not an offset into the code
+    mov [data_split], rax
+    ret
+
 ; label_name_len — length of the name at rdi, up to whitespace or end of line.
 ; Returns it in rcx, which is what add_symbol and hash_str_token expect.
 ; Shared by "name db ..." and "name resb ..." rather than written twice: two
@@ -540,7 +861,8 @@ add_symbol_abs:
     mov rcx, 24
     mov rax, rbx
     mul rcx
-    lea rdi, [sym_tbl + rax]
+    lea rdi, [rip + sym_tbl]
+    add rdi, rax
     pop rax
     mov [rdi], rax
     mov [rdi+8], r9
@@ -551,14 +873,11 @@ add_symbol_abs:
     ret
 
 sym_overflow:
-    mov rax, 1
-    mov rdi, 2
-    mov rsi, sym_msg
+    lea rsi, [rip + sym_msg]
     mov rdx, sym_msg_len
-    syscall
-    mov rax, 60
+    call os_err
     mov rdi, 1
-    syscall
+    call os_exit
 
 hash_str_token:
     mov rax, 5381
@@ -631,7 +950,9 @@ word_key:
     je .fill
     cmp rcx, 4
     jge .skip_rest
-    mov byte [key_buf + rcx], al
+    lea rbx, [rip + key_buf]
+    add rbx, rcx
+    mov byte [rbx], al
     inc rcx
     inc rdi
     jmp .copy
@@ -645,7 +966,9 @@ word_key:
 .fill:
     cmp rcx, 4
     jge .done
-    mov byte [key_buf + rcx], ' '
+    lea rbx, [rip + key_buf]
+    add rbx, rcx
+    mov byte [rbx], ' '
     inc rcx
     jmp .fill
 .done:
@@ -719,6 +1042,8 @@ parse_instruction:
     je parse_shift
     cmp r15, 9
     je .data_dir
+    cmp r15, 10
+    je parse_int
     jmp error_exit              ; table entry with an unknown type
 
 .data_dir:
@@ -735,7 +1060,7 @@ parse_instruction:
     mov dword [mnemonic_buf], eax   ; keep word 1 for the error message
     call is_directive
     cmp rdx, 1
-    je .skip
+    je .maybe_section
 
     mov rdi, r12                ; look at the second word
 .skip_ws:
@@ -781,6 +1106,33 @@ parse_instruction:
     mov eax, [mnemonic_buf]
     mov dword [key_buf], eax
     jmp unknown_mnemonic
+
+.maybe_section:
+    ; Directives are ignored -- except that `section .data` marks where the
+    ; writable half of the image begins, which is the whole basis of emitting
+    ; two segments instead of one.
+    mov eax, [mnemonic_buf]
+    cmp eax, 'sect'
+    jne .skip
+    mov rdi, r12
+.sec_ws:
+    movzx rax, byte [rdi]
+    cmp al, ' '
+    je .sec_adv
+    cmp al, 9
+    je .sec_adv
+    jmp .sec_word
+.sec_adv:
+    inc rdi
+    jmp .sec_ws
+.sec_word:
+    call word_key
+    cmp eax, '.dat'
+    jne .skip
+    cmp qword [data_split], 0   ; only the FIRST one is a split
+    jne .skip
+    jmp start_data_section
+
 .skip:
     ret
 
@@ -795,7 +1147,7 @@ parse_instruction:
     ; first reference to a global with an empty "Error:" and nothing else.
     mov rdi, r13
     call label_name_len
-    mov rax, bss_vaddr
+    mov rax, [bss_base]
     add rax, [bss_size]
     call add_symbol_abs
 
@@ -925,9 +1277,20 @@ parse_operand:
     cmp rdx, 1
     je .imm
     ; A label not yet defined. Tolerated in pass 1, an error by pass 2.
+    ;
+    ; The placeholder is out_base, NOT zero, and that is a correctness
+    ; requirement rather than tidiness. `mov reg, imm` is seven bytes when the
+    ; value fits in a signed 32-bit field and ten when it does not, so a
+    ; placeholder of zero sizes a forward reference as the short form in pass 1
+    ; and pass 2 then emits the long one. Every label after that point is wrong
+    ; by three bytes per occurrence, and the program jumps into the middle of an
+    ; instruction. It never showed up at 0x400000 because both the placeholder
+    ; and the real address fit in 32 bits there; at nano-os's 512 GiB, neither
+    ; does. out_base is the lowest address any symbol in the output can have,
+    ; so it is in the same size class as all of them.
     test r11, r11
     jnz error_exit
-    xor rax, rax
+    mov rax, [out_base]
 .imm:
     mov qword [r15], 2          ; kind = immediate
     mov [r15 + 16], rax
@@ -972,7 +1335,7 @@ parse_operand:
     jne .rip_got
     test r11, r11
     jnz error_exit
-    xor rax, rax
+    mov rax, [out_base]         ; same size class as the real value; see .imm
 .rip_got:
     mov [r15 + 16], rax         ; absolute target address
     jmp .label_disp
@@ -985,7 +1348,7 @@ parse_operand:
     jne .label_got
     test r11, r11
     jnz error_exit
-    xor rax, rax
+    mov rax, [out_base]         ; same size class as the real value; see .imm
 .label_got:
     mov [r15 + 16], rax
     ; fall through: a label may carry a displacement too
@@ -1218,9 +1581,9 @@ parse_alu:
     movzx rbp, byte [rsi + 5]   ; base opcode
     movzx rax, byte [rsi + 6]   ; /digit for the immediate forms
     mov [alu_digit], rax        ; NOT r14: that is the input end pointer
-    mov rdi, opA
+    lea rdi, [rip + opA]
     call parse_operand
-    mov rdi, opB
+    lea rdi, [rip + opB]
     call parse_operand
 
     ; Before anything else: this instruction group has no 8-bit forms here, and
@@ -1240,18 +1603,18 @@ parse_alu:
 
     ; reg, reg
     mov r12, [opB + 8]
-    mov r15, opA
+    lea r15, [rip + opA]
     jmp encode_rm
 
 .mem_dst:                       ; mem, reg
     mov r12, [opB + 8]
-    mov r15, opA
+    lea r15, [rip + opA]
     jmp encode_rm
 
 .mem_src:                       ; reg, mem  ->  opcode + 2
     add rbp, 2
     mov r12, [opA + 8]
-    mov r15, opB
+    lea r15, [rip + opB]
     jmp encode_rm
 
 .imm_form:
@@ -1264,7 +1627,7 @@ parse_alu:
     cmp rax, -128
     jl .imm32
     mov rbp, 0x83
-    mov r15, opA
+    lea r15, [rip + opA]
     push rdx
     call encode_rm
     pop rdx
@@ -1294,7 +1657,7 @@ parse_alu:
 
 .imm32_general:
     mov rbp, 0x81
-    mov r15, opA
+    lea r15, [rip + opA]
     push rdx
     call encode_rm
     pop rdx
@@ -1312,9 +1675,9 @@ parse_alu:
 ; ------------------------------------------------------------------------------
 parse_mov:
     mov qword [rex_w], 1
-    mov rdi, opA
+    lea rdi, [rip + opA]
     call parse_operand
-    mov rdi, opB
+    lea rdi, [rip + opB]
     call parse_operand
 
     ; A byte-sized register on either side selects the 8-bit opcodes and drops
@@ -1333,13 +1696,13 @@ parse_mov:
     ; reg/mem <- reg
     mov rbp, 0x89
     mov r12, [opB + 8]
-    mov r15, opA
+    lea r15, [rip + opA]
     jmp encode_rm
 
 .from_mem:
     mov rbp, 0x8B
     mov r12, [opA + 8]
-    mov r15, opB
+    lea r15, [rip + opB]
     jmp encode_rm
 
 .byte_form:
@@ -1351,13 +1714,13 @@ parse_mov:
     ; r/m8 <- reg8
     mov rbp, 0x88
     mov r12, [opB + 8]
-    mov r15, opA
+    lea r15, [rip + opA]
     jmp encode_rm
 .byte_from_mem:
     ; reg8 <- r/m8
     mov rbp, 0x8A
     mov r12, [opA + 8]
-    mov r15, opB
+    lea r15, [rip + opB]
     jmp encode_rm
 
 .imm_form:
@@ -1400,7 +1763,7 @@ parse_mov:
 .imm32:
     mov rbp, 0xC7
     xor r12, r12                ; /0
-    mov r15, opA
+    lea r15, [rip + opA]
     call encode_rm
     mov rdi, [imm_tmp]
     call emit_dword
@@ -1416,7 +1779,7 @@ parse_shift:
     mov qword [rex_w], 1
     movzx rax, byte [rsi + 5]   ; /digit: 4 = shl, 5 = shr, 7 = sar
     mov [alu_digit], rax
-    mov rdi, opA
+    lea rdi, [rip + opA]
     call parse_operand
 
     ; second operand: "cl" or an immediate
@@ -1429,7 +1792,7 @@ parse_shift:
 
     mov rbp, 0xD3
     mov r12, [alu_digit]
-    mov r15, opA
+    lea r15, [rip + opA]
     jmp encode_rm
 
 .imm:
@@ -1443,7 +1806,7 @@ parse_shift:
     je .by_one
     mov rbp, 0xC1
     mov r12, [alu_digit]
-    mov r15, opA
+    lea r15, [rip + opA]
     push rbx
     call encode_rm
     pop rbx
@@ -1454,7 +1817,7 @@ parse_shift:
 .by_one:
     mov rbp, 0xD1
     mov r12, [alu_digit]
-    mov r15, opA
+    lea r15, [rip + opA]
     jmp encode_rm
 
 ; jmp rel32  ->  E9 cd  (5 bytes)
@@ -1551,6 +1914,35 @@ parse_sys:
     mov rdi, 0x0F
     call emit_byte
     mov rdi, 0x05
+    call emit_byte
+.skip_emit:
+    add qword [pc_vaddr], 2
+    ret
+
+; int N -- CD ib. Two bytes, and the only way a program says anything to
+; nano-os, whose syscall boundary is vector 0x80. `syscall` is the Linux
+; equivalent and was already here; without this one the assembler could build
+; programs for exactly one of the two operating systems it now runs on.
+;
+; The operand is required to be a number in 0..255. `int` with a label, or with
+; 0x180, is a mistake rather than something to truncate quietly.
+parse_int:
+    call get_token
+    cmp rcx, 0
+    je error_exit
+    call is_number
+    cmp rdx, 1
+    jne error_exit
+    cmp rax, 0
+    jl error_exit
+    cmp rax, 255
+    jg error_exit
+    mov [imm_tmp], rax
+    test r11, r11
+    jz .skip_emit
+    mov rdi, 0xCD
+    call emit_byte
+    mov rdi, [imm_tmp]
     call emit_byte
 .skip_emit:
     add qword [pc_vaddr], 2
@@ -1922,7 +2314,8 @@ find_symbol:
     jge .not_found
     mov r10, r9
     imul r10, 24
-    lea r8, [sym_tbl + r10]
+    lea r8, [rip + sym_tbl]
+    add r8, r10
     mov r10, [r8]
     cmp r10, rax
     jne .next_sym
@@ -1941,8 +2334,9 @@ find_symbol:
 emit_byte:
     test r11, r11
     jz .skip
-    mov rbx, [out_ptr]
-    mov byte [out_buf + rbx], dil
+    lea rbx, [rip + out_buf]
+    add rbx, [out_ptr]
+    mov byte [rbx], dil
     inc qword [out_ptr]
 .skip:
     ret
@@ -1950,12 +2344,23 @@ emit_byte:
 emit_dword:
     test r11, r11
     jz .skip
-    mov rbx, [out_ptr]
-    mov dword [out_buf + rbx], edi
+    lea rbx, [rip + out_buf]
+    add rbx, [out_ptr]
+    mov dword [rbx], edi
     add qword [out_ptr], 4
 .skip:
     ret
 
+; ADDRESSING NOTE, for the six places below and above that look roundabout.
+;
+; `mov byte [out_buf + rbx], dil` encodes out_buf as a 32-bit absolute address.
+; That is fine at 0x400000 and impossible at 0x8000000000, which is where
+; nano-os puts user memory -- ld refuses it with "relocation truncated to fit",
+; which is the good outcome, but only after the address is chosen. So a symbol
+; plus a register index is written as a RIP-relative lea and an add: two
+; instructions instead of one, and no assumption about how high the program
+; lives.
+;
 ; ------------------------------------------------------------------------------
 ; emit_qword: rdi = 64-bit value, little-endian, as two dwords.
 ; The value goes through a bss slot rather than a register because emit_dword
@@ -2004,6 +2409,7 @@ opcode_table:
     db "ret ", 5, 0xC3, 0, 0
     db "sysc", 6, 0x0F, 0x05, 0
     db "sys ", 6, 0x0F, 0x05, 0
+    db "int ", 10, 0xCD, 0, 0
     db "db  ", 7, 0, 0, 0
     db "dw  ", 9, 0, 2, 0   ; element width lives in the /digit byte
     db "dd  ", 9, 0, 4, 0
